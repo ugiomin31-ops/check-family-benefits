@@ -1,7 +1,7 @@
 // Versioned app-shell cache. External forms and personal notes are not cached here.
 const BASE=new URL('./',self.location.href);
 const PREFIX='check-family:'+BASE.pathname+':';
-const VERSION=PREFIX+'057e1071e9177494';
+const VERSION=PREFIX+'853618ee8b73d7de';
 const FILES=['./','./index.html','./styles.css','./v2.css','./cloud.css','./app.js','./ui-v2.js','./engine.js','./cloud-logic.js','./cloud-sync.bundle.js','./firebase-config.js','./data.json','./manifest.webmanifest','./icons/icon.svg','./icons/icon-192.png','./icons/icon-512.png','./icons/maskable-512.png','./icons/apple-touch-icon.png'];
 const ASSETS=new Set(FILES.map(p=>new URL(p,BASE).href));
 self.addEventListener('install',event=>{
