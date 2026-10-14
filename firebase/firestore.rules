@@ -1,0 +1,344 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function validFamilyId(fid) {
+      return fid is string
+        && fid.size() >= 1
+        && fid.size() <= 128
+        && fid.matches('^[A-Za-z0-9_-]+$');
+    }
+
+    function validInvitationId(invitationId) {
+      // 32 random bytes encoded as unpadded base64url are exactly 43 chars.
+      return invitationId is string
+        && invitationId.size() == 43
+        && invitationId.matches('^[A-Za-z0-9_-]+$');
+    }
+
+    function validCheckId(checkId) {
+      return checkId is string
+        && checkId.size() >= 1
+        && checkId.size() <= 100
+        && checkId.matches('^[A-Za-z0-9_-]+$');
+    }
+
+    function validCustomId(customId) {
+      return customId is string
+        && customId.matches('^custom-[A-Za-z0-9_-]{1,70}$');
+    }
+
+    function familyDoc(fid) {
+      return get(/databases/$(database)/documents/families/$(fid));
+    }
+
+    function familyAfter(fid) {
+      return getAfter(/databases/$(database)/documents/families/$(fid));
+    }
+
+    function invitationDoc(invitationId) {
+      return get(/databases/$(database)/documents/invitations/$(invitationId));
+    }
+
+    function invitationAfter(invitationId) {
+      return getAfter(/databases/$(database)/documents/invitations/$(invitationId));
+    }
+
+    function isFamilyMember(fid) {
+      return signedIn()
+        && validFamilyId(fid)
+        && request.auth.uid in familyDoc(fid).data.members;
+    }
+
+    function isFamilyOwner(fid) {
+      return signedIn()
+        && validFamilyId(fid)
+        && familyDoc(fid).data.ownerUid == request.auth.uid;
+    }
+
+    function validDate(value) {
+      return value is string
+        && value.matches('^20[0-9][0-9]-(0[1-9]|1[0-2])-([0-2][0-9]|3[0-1])$');
+    }
+
+    function validOptionalDate(value) {
+      return value is string && (value == '' || validDate(value));
+    }
+
+    function exactFamilyKeys(data) {
+      return data.keys().hasAll(['ownerUid', 'members', 'createdAt', 'lastInviteId'])
+        && data.keys().hasOnly(['ownerUid', 'members', 'createdAt', 'lastInviteId']);
+    }
+
+    function validFamilyShape(data) {
+      return exactFamilyKeys(data)
+        && data.ownerUid is string
+        && data.members is list
+        && data.members.size() >= 1
+        && data.members.size() <= 2
+        && data.ownerUid in data.members
+        && data.createdAt is timestamp
+        && data.lastInviteId is string
+        && data.lastInviteId.size() <= 43;
+    }
+
+    function validFamilyCreate(fid) {
+      return signedIn()
+        && validFamilyId(fid)
+        && validFamilyShape(request.resource.data)
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.members == [request.auth.uid]
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.lastInviteId in ['', ' '];
+    }
+
+    function validOwnerRevocation() {
+      return signedIn()
+        && resource.data.ownerUid == request.auth.uid
+        && resource.data.members.size() == 2
+        && request.resource.data.members.size() == 1
+        && request.resource.data.members[0] == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members']);
+    }
+
+    function validInviteJoin(fid) {
+      let token = request.resource.data.lastInviteId;
+      let inviteBefore = invitationDoc(token).data;
+      let inviteAfter = invitationAfter(token).data;
+      return signedIn()
+        && validInvitationId(token)
+        && !(request.auth.uid in resource.data.members)
+        && request.resource.data.members.size() == resource.data.members.size() + 1
+        && request.resource.data.members.size() <= 2
+        && request.resource.data.members.hasAll(resource.data.members)
+        && request.auth.uid in request.resource.data.members
+        && request.resource.data.lastInviteId != resource.data.lastInviteId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members', 'lastInviteId'])
+        && inviteBefore.familyId == fid
+        && inviteBefore.createdBy == resource.data.ownerUid
+        && inviteBefore.redeemedBy == null
+        && inviteBefore.expiresAt is timestamp
+        && inviteBefore.expiresAt > request.time
+        && inviteAfter.familyId == fid
+        && inviteAfter.createdBy == inviteBefore.createdBy
+        && inviteAfter.redeemedBy == request.auth.uid
+        && inviteAfter.createdAt == inviteBefore.createdAt
+        && inviteAfter.expiresAt == inviteBefore.expiresAt;
+    }
+
+    function validInvitationShape(data) {
+      return data.keys().hasAll([
+          'familyId', 'createdBy', 'redeemedBy', 'createdAt', 'expiresAt'
+        ])
+        && data.keys().hasOnly([
+          'familyId', 'createdBy', 'redeemedBy', 'createdAt', 'expiresAt'
+        ])
+        && validFamilyId(data.familyId)
+        && data.createdBy is string
+        && (data.redeemedBy == null || data.redeemedBy is string)
+        && data.createdAt is timestamp
+        && data.expiresAt is timestamp
+        && data.expiresAt > data.createdAt;
+    }
+
+    function validInvitationCreate(invitationId) {
+      return signedIn()
+        && validInvitationId(invitationId)
+        && validInvitationShape(request.resource.data)
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.redeemedBy == null
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt <= request.time + duration.value(49, 'h')
+        && isFamilyOwner(request.resource.data.familyId);
+    }
+
+    function validInvitationRedeem(invitationId) {
+      let familyBefore = familyDoc(resource.data.familyId).data;
+      let familyNext = familyAfter(resource.data.familyId).data;
+      return signedIn()
+        && validInvitationId(invitationId)
+        && validInvitationShape(request.resource.data)
+        && resource.data.redeemedBy == null
+        && request.resource.data.redeemedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['redeemedBy'])
+        && resource.data.expiresAt > request.time
+        && familyBefore.ownerUid == resource.data.createdBy
+        && !(request.auth.uid in familyBefore.members)
+        && familyNext.ownerUid == familyBefore.ownerUid
+        && familyNext.createdAt == familyBefore.createdAt
+        && familyNext.members.size() == familyBefore.members.size() + 1
+        && familyNext.members.size() <= 2
+        && familyNext.members.hasAll(familyBefore.members)
+        && request.auth.uid in familyNext.members
+        && familyNext.lastInviteId == invitationId
+        && familyBefore.lastInviteId != invitationId;
+    }
+
+    function validCheckWrite(checkId) {
+      let data = request.resource.data;
+      return validCheckId(checkId)
+        && data.keys().hasAll([
+          'status', 'notes', 'docs', 'reviewed', 'date', 'changedBy', 'changedAt'
+        ])
+        && data.keys().hasOnly([
+          'status', 'notes', 'docs', 'reviewed', 'date', 'changedBy', 'changedAt'
+        ])
+        && data.status is string
+        && data.status in ['todo', 'doing', 'applied', 'done', 'na']
+        && data.notes is string
+        && data.notes.size() <= 4000
+        && data.docs is list
+        && data.docs.size() <= 100
+        && validOptionalDate(data.reviewed)
+        && validOptionalDate(data.date)
+        && data.changedBy == request.auth.uid
+        && data.changedAt is timestamp
+        && data.changedAt == request.time;
+    }
+
+    function validCustomWrite(customId) {
+      let data = request.resource.data;
+      return validCustomId(customId)
+        && data.keys().hasAll([
+          'id', 'title', 'summary', 'url', 'date', 'changedBy', 'changedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'title', 'summary', 'url', 'date', 'changedBy', 'changedAt'
+        ])
+        && data.id == customId
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 120
+        && data.summary is string
+        && data.summary.size() <= 2000
+        && data.url is string
+        && data.url.size() <= 2500
+        && validDate(data.date)
+        && data.changedBy == request.auth.uid
+        && data.changedAt is timestamp
+        && data.changedAt == request.time;
+    }
+
+    function validProfileMap(profile) {
+      return profile.keys().hasAll([
+          'dueMonth', 'dueDate', 'birthDate', 'region', 'childOrder', 'multiple',
+          'motherWork', 'fatherWork', 'moveInDate', 'motherLeaveStart',
+          'fatherLeaveStart', 'district'
+        ])
+        && profile.keys().hasOnly([
+          'dueMonth', 'dueDate', 'birthDate', 'region', 'childOrder', 'multiple',
+          'motherWork', 'fatherWork', 'moveInDate', 'motherLeaveStart',
+          'fatherLeaveStart', 'district'
+        ])
+        && profile.dueMonth is string
+        && profile.dueMonth.matches('^20[0-9][0-9]-(0[1-9]|1[0-2])$')
+        && validOptionalDate(profile.dueDate)
+        && validOptionalDate(profile.birthDate)
+        && profile.region in [
+          'unknown', 'dongducheon', 'uijeongbu', 'gyeonggi', 'seoul', 'other'
+        ]
+        && profile.childOrder in ['unknown', '1', '2', '3']
+        && profile.multiple in ['unknown', 'single', 'twins', 'more']
+        && profile.motherWork in ['unknown', 'employee', 'public', 'self', 'other']
+        && profile.fatherWork in ['unknown', 'employee', 'public', 'self', 'other']
+        && validOptionalDate(profile.moveInDate)
+        && validOptionalDate(profile.motherLeaveStart)
+        && validOptionalDate(profile.fatherLeaveStart)
+        && profile.district is string
+        && profile.district.size() <= 50;
+    }
+
+    function validProfileWrite() {
+      let data = request.resource.data;
+      return data.keys().hasAll(['profile', 'changedBy', 'changedAt'])
+        && data.keys().hasOnly(['profile', 'changedBy', 'changedAt'])
+        && data.profile is map
+        && validProfileMap(data.profile)
+        && data.changedBy == request.auth.uid
+        && data.changedAt is timestamp
+        && data.changedAt == request.time;
+    }
+
+    match /users/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list: if false;
+
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasAll(['activeFamilyId'])
+        && request.resource.data.keys().hasOnly(['activeFamilyId'])
+        && request.resource.data.activeFamilyId is string
+        && (
+          request.resource.data.activeFamilyId == ''
+          || (
+            validFamilyId(request.resource.data.activeFamilyId)
+            && request.auth.uid in familyAfter(request.resource.data.activeFamilyId).data.members
+          )
+        );
+    }
+
+    match /families/{fid} {
+      allow get: if isFamilyMember(fid);
+      allow list: if false;
+      allow create: if validFamilyCreate(fid);
+      allow update: if validFamilyShape(request.resource.data)
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.createdAt == resource.data.createdAt
+        && (
+          validOwnerRevocation()
+          || validInviteJoin(fid)
+        );
+
+      match /checks/{checkId} {
+        allow get, list: if isFamilyMember(fid);
+        allow create, update: if isFamilyMember(fid) && validCheckWrite(checkId);
+        allow delete: if isFamilyMember(fid);
+      }
+
+      match /custom/{customId} {
+        allow get, list: if isFamilyMember(fid);
+        allow create, update: if isFamilyMember(fid) && validCustomWrite(customId);
+        allow delete: if isFamilyMember(fid);
+      }
+
+      match /config/{configId} {
+        allow get: if configId == 'profile' && isFamilyMember(fid);
+        allow list: if false;
+        allow create, update: if configId == 'profile'
+          && isFamilyMember(fid)
+          && validProfileWrite();
+        allow delete: if false;
+      }
+    }
+
+    match /invitations/{invitationId} {
+      allow get: if signedIn()
+        && validInvitationId(invitationId)
+        && (
+          (
+            resource.data.createdBy == request.auth.uid
+            && isFamilyOwner(resource.data.familyId)
+          )
+          || resource.data.redeemedBy == request.auth.uid
+          || (
+            resource.data.redeemedBy == null
+            && resource.data.expiresAt is timestamp
+            && resource.data.expiresAt > request.time
+          )
+        );
+      allow list: if false;
+      allow create: if validInvitationCreate(invitationId);
+      allow update: if validInvitationRedeem(invitationId);
+      allow delete: if signedIn()
+        && validInvitationId(invitationId)
+        && resource.data.createdBy == request.auth.uid
+        && resource.data.redeemedBy == null
+        && isFamilyOwner(resource.data.familyId);
+    }
+  }
+}

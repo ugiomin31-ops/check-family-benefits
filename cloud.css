@@ -1,0 +1,15 @@
+.cloud-stack{display:grid;gap:14px;color:#4e5968;font-size:13px;line-height:1.75}
+.cloud-stack h3{font-size:18px}
+.cloud-stack p{font-size:12px;line-height:1.85}
+.cloud-stack small{color:#8b95a1;line-height:1.75;font-size:11px}
+.cloud-buttons{display:flex;gap:10px;flex-wrap:wrap}
+.cloud-note{background:#f5f8fc;border-radius:13px;padding:14px 16px;color:#657383;font-size:11px;line-height:1.85}
+.cloud-connect-status{display:flex;align-items:flex-start;gap:11px}
+.cloud-connect-status strong{display:block;color:#191f28;font-size:14px}
+.cloud-connect-status small{display:block;margin-top:3px}
+.cloud-online-dot{flex-shrink:0;width:10px;height:10px;background:#2bb58d;border-radius:50%;margin-top:8px}
+#cloud-invite-input,#cloud-invite-url{font-size:12px;word-break:break-all}
+.cloud-stack .field{margin-top:6px}
+.cloud-stack .field span{font-weight:650}
+.cloud-stack .secondary-button{font-size:12px}
+@media(max-width:760px){.cloud-buttons{display:grid;grid-template-columns:1fr}.cloud-stack{gap:13px}.cloud-stack h3{font-size:16px}.cloud-connect-status strong{font-size:13px}}

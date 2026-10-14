@@ -1,5 +1,6 @@
 import {homeV2,timelineV2,rowV2,badgeV2,cardV2,detailV2} from './ui-v2.js';
 import {VERSION,STORAGE_KEY,CHECKED_AT,RANGE,REGIONS,STATUS,EVIDENCE,DEFAULT_PROFILE,parseDate,addDays,addMonths,todayKST,monthLabel,dateLabel,fullDateLabel,monthsInRange,safeURL,sanitizeProfile,sanitizeState,freshState,checkFor,materializeItems,isOpen,rankItems,matchesSearch,buildICS} from './engine.js';
+import {validConfig,familyStorageKey,familyDiff,legacyMissing} from './cloud-logic.js';
 
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -36,19 +37,28 @@ const icon=(name,cls='')=>`<svg viewBox="0 0 24 24" aria-hidden="true"${cls?` cl
 const categoryIcon=c=>/의료|건강|임신|출산/.test(c)?'heart':/직장|고용|휴직/.test(c)?'briefcase':/교통/.test(c)?'train':/세금|주거/.test(c)?'home':/지역/.test(c)?'location':/이벤트/.test(c)?'gift':/수당|급여|생활비|지원금/.test(c)?'card':/돌봄|보육/.test(c)?'baby':/점검/.test(c)?'refresh':'doc';
 const NAV=[['home','home','홈'],['timeline','calendar','일정'],['benefits','heart','혜택'],['events','gift','이벤트'],['settings','settings','설정']];
 let data,state,allItems=[],storageError='',corruptBackup='',activeItemId='',lastFocus=null,toastTimer,notesTimer,undoState=null,deferredInstall=null,registration=null,waitingWorker=null,reloadForUpdate=false,pendingImport=null;
+let currentStorageKey=STORAGE_KEY,lastSavedState=null,cloudClient=null;
+let cloudState={configured:false,phase:'setup',email:'',familyId:'',members:0,pending:0,owner:false,invitationUrl:'',detail:'Firebase 프로젝트 연결 전'};
+const cloneState=v=>JSON.parse(JSON.stringify(v));
 const today=todayKST();
 const within=m=>m<RANGE.start?RANGE.start:m>RANGE.end?RANGE.end:m;
 const ui={view:'home',month:within(today.slice(0,7)),year:within(today.slice(0,7)).slice(0,4),category:'전체',query:'',status:'all',mineOnly:false,hideComplete:false,sourceQuery:'',information:'all',timelineEvents:false};
 
-function readState(){
- try{const raw=localStorage.getItem(STORAGE_KEY);if(!raw)return freshState();try{return sanitizeState(JSON.parse(raw));}catch{corruptBackup=raw;storageError='저장된 기록을 읽지 못했어요. 기존 기록은 덮어쓰지 않았습니다. 설정에서 원본을 백업하고 초기화해 주세요.';return freshState();}}
+function readState(key=currentStorageKey){
+ try{const raw=localStorage.getItem(key);if(!raw)return freshState();try{return sanitizeState(JSON.parse(raw));}catch{corruptBackup=raw;storageError='저장된 기록을 읽지 못했어요. 기존 기록은 덮어쓰지 않았습니다. 설정에서 원본을 백업하고 초기화해 주세요.';return freshState();}}
  catch{storageError='브라우저 저장소를 사용할 수 없어요. 체크는 이 창에서만 유지됩니다. JSON 백업을 꼭 내려받아 주세요.';return freshState();}
 }
 function rebuild(){allItems=materializeItems(data,state);}
-function persist(){
+function persist({remote=false}={}){
  state.updatedAt=new Date().toISOString();
  if(corruptBackup)return false;
- try{localStorage.setItem(STORAGE_KEY,JSON.stringify(state));return true;}catch{storageError='기기 저장에 실패했어요. 용량·비공개 모드를 확인하고 JSON 백업을 내려받아 주세요.';toast(storageError);return false;}
+ try{
+  localStorage.setItem(currentStorageKey,JSON.stringify(state));
+  const previous=lastSavedState;
+  lastSavedState=cloneState(state);
+  if(!remote&&cloudClient?.familyId&&previous)cloudClient.syncChanges(familyDiff(previous,state));
+  return true;
+ }catch{storageError='기기 저장에 실패했어요. 용량·비공개 모드를 확인하고 JSON 백업을 내려받아 주세요.';toast(storageError);return false;}
 }
 function setCheck(id,patch){state.checks[id]={...checkFor(state,id),...patch};const saved=persist();rebuild();return saved;}
 function itemById(id){return allItems.find(i=>i.id===id);}
@@ -56,6 +66,7 @@ function navHTML(){return NAV.map(([key,ic,title])=>`<button type="button" class
 function refreshNav(){ $('#desktop-nav').innerHTML=navHTML();$('#mobile-nav').innerHTML=navHTML(); }
 function route(){
  const hash=location.hash.slice(1);
+ if(hash.startsWith('join/')){ui.view='settings';render();return;}
  if(hash.startsWith('item/')){ui.view='benefits';render();openItem(decodeURIComponent(hash.slice(5)));return;}
  if(hash==='sources'){ui.view='sources';render();return;}
  if(NAV.some(n=>n[0]===hash)){ui.view=hash;render();return;}
@@ -96,10 +107,28 @@ function renderLibrary(events=false){
 }
 function options(values,current){return Object.entries(values).map(([v,l])=>`<option value="${esc(v)}"${v===current?' selected':''}>${esc(l)}</option>`).join('');}
 function settingsAction(action,ic,title,sub){return `<button class="setting-action" data-action="${action}">${icon(ic)}<span><strong>${esc(title)}</strong><small>${esc(sub)}</small></span>${icon('arrow','arrow')}</button>`;}
+function cloudPanel(){
+ const c=cloudState;
+ const help='<a href="https://console.firebase.google.com/" target="_blank" rel="noopener noreferrer">Firebase 콘솔 열기 ↗</a>';
+ if(!c.configured)return `<div class="cloud-stack"><span class="pill amber">초기 설정 필요</span><h3>부부 자동 동기화를 준비했어요</h3><p>GitHub Pages 앱은 사용 가능하며, Firebase 프로젝트의 웹 설정을 넣으면 각자 Google 로그인과 가족 공유가 활성화돼요.</p><p>설치 설명: <strong>FIREBASE_SETUP.md</strong> · ${help}</p><div class="cloud-note">Firebase 연결 전에도 기존 CHECK 기록은 이 브라우저에 그대로 저장됩니다. 비밀번호나 서비스 계정 키를 GitHub에 올리지 마세요.</div></div>`;
+ if(c.phase==='auth-loading')return '<p>Google 로그인 상태를 확인하고 있어요…</p>';
+ if(c.phase==='signed-out'||c.phase==='error')return `<div class="cloud-stack"><span class="pill blue">보호되는 가족 공간</span><h3>Google 계정으로 가족 기록 연결</h3><p>부부가 서로 다른 Google 계정으로 로그인한 후 초대 링크로 하나의 체크리스트를 공유할 수 있어요.</p><button class="primary-button" data-action="cloud-login">${icon('lock')} Google 계정으로 로그인</button><small>Google 로그인을 선택하면 Firebase 인증으로 연결됩니다. 가족 정보와 메모는 가족 구성원에게만 공개되며 일반 웹 방문자에게는 공개하지 않습니다.</small></div>`;
+ if(!c.familyId)return `<div class="cloud-stack"><span class="pill blue">로그인됨</span><strong>${esc(c.email||'Google 계정')}</strong><p>새 가족을 만들면 이 기기에 저장된 CHECK 기록을 첫 가족 기록으로 가져옵니다. 배우자는 받은 초대 링크로 참여합니다.</p><div class="cloud-buttons"><button class="primary-button" data-action="cloud-create-confirm">${icon('plus')} 현재 기록으로 가족 만들기</button><button class="secondary-button" data-action="cloud-signout">로그아웃</button></div><label class="field"><span>배우자에게 받은 초대 링크</span><input id="cloud-invite-input" type="text" autocomplete="off" spellcheck="false" placeholder="링크를 붙여넣어 주세요" value="${esc(location.hash.startsWith('#join/')?location.href:'')}"></label><button class="secondary-button" data-action="cloud-join">초대 링크로 가족 참여하기</button><div class="cloud-note">배우자 계정으로 참여하면 그 가족의 클라우드 기록을 불러옵니다. 현재 기기에 남아 있는 기존 기록은 별도로 보존하며 자동으로 덮어쓰거나 합치지 않습니다.</div></div>`;
+ return `<div class="cloud-stack"><div class="cloud-connect-status"><span class="cloud-online-dot"></span><div><strong>우리 가족 체크리스트 연결됨</strong><small>${esc(c.email)} · ${c.members||1}/2명 · ${esc(c.detail||'연결됨')}</small></div></div><div class="cloud-buttons">${c.owner&&c.members<2?'<button class="primary-button" data-action="cloud-invite">배우자 초대 링크 만들기</button>':''}<button class="secondary-button" data-action="cloud-import">기존 기록에서 없는 항목 추가</button><button class="secondary-button" data-action="cloud-signout">로그아웃</button></div>${c.invitationUrl?`<label class="field"><span>48시간 유효한 일회용 초대 링크</span><input readonly id="cloud-invite-url" value="${esc(c.invitationUrl)}"></label><button class="secondary-button" data-action="cloud-copy-invite">${icon('download')} 초대 링크 복사</button>`:''}${c.owner&&c.members===2?'<button class="text-button" data-action="cloud-remove-confirm">배우자 연결 해제</button>':''}<div class="cloud-note">항목별 체크·메모·가족 설정을 자동 반영합니다. 인터넷이 끊기면 이 기기 기록을 사용하며 다시 연결되면 전송을 시도해요. 같은 항목을 동시에 수정하면 마지막으로 서버에 반영된 값이 남을 수 있어요. Google 로그인·브라우저 캐시는 신뢰할 수 있는 개인 기기에서만 사용하세요.</div></div>`;
+}
+function updateCloudPanel(){
+ const area=$('#cloud-panel');
+ if(area&&!(document.activeElement?.matches('input,textarea')&&document.activeElement.closest('#cloud-panel')))area.innerHTML=cloudPanel();
+ network();
+ const sb=$('.sidebar-bottom strong'),hint=$('.sidebar-bottom p');
+ if(sb)sb.textContent=cloudState.familyId?'부부 가족 공유 연결됨':'이 기기에 안전하게 준비';
+ if(hint)hint.textContent=cloudState.familyId?'Google 로그인 · Firestore 동기화':'계정 연결 전에도 오프라인 사용';
+}
 function renderSettings(){
  const p=state.profile;
  const work={unknown:'아직 설정하지 않음',employee:'일반 근로자 · 고용보험 확인',public:'공무원·교원·사학 등 별도 확인',self:'자영업·프리랜서 등',other:'그 밖의 경우'};
- return heading('YOUR SETTINGS','우리 가족에 맞게','체크와 메모는 이 브라우저에만 저장돼요.<br>주민번호·계좌번호·증빙 파일은 입력하지 마세요.')+
+ return heading('YOUR SETTINGS','우리 가족에 맞게','부부 가족 공유를 설정하거나 기기별 기록을 백업할 수 있어요.<br>주민번호·계좌번호·증빙 파일은 입력하지 마세요.')+
+ `<section class="section-block"><h2>부부 자동 동기화</h2><div class="panel panel-pad" id="cloud-panel">${cloudPanel()}</div></section>`+
  `<section class="section-block"><h2>우리 가족 정보</h2><form id="profile-form" class="panel panel-pad"><div class="form-grid">
  <label class="field"><span>출산 예정월</span><input type="month" name="dueMonth" value="${esc(p.dueMonth)}" min="2026-01" max="2029-12" required><small>날짜를 모르면 월만 입력해도 돼요.</small></label>
  <label class="field"><span>정확한 출산 예정일 · 선택</span><input type="date" name="dueDate" value="${esc(p.dueDate)}" min="2026-01-01" max="2029-12-31"><small>입력하면 위 예정월도 함께 바뀌어요.</small></label>
@@ -121,7 +150,7 @@ function renderSettings(){
  ${settingsAction('calendar','calendar','캘린더에 일정 보내기','ICS 파일을 가져와 캘린더 앱에서 알림을 설정해요.')}
  ${settingsAction('add-custom','plus','내 할 일 추가','지역 창구에서 확인한 혜택이나 개인 준비를 추가해요.')}
  ${corruptBackup?settingsAction('export-corrupt','doc','읽지 못한 기존 기록 보관','초기화 전에 원본 저장값을 내려받아 주세요.'):''}
- </div><p class="settings-warning">브라우저 데이터 삭제·기기 교체·접속 주소 변경 시 기록이 사라지거나 다른 저장소로 열릴 수 있어요. 부부·기기 사이 자동 동기화는 없어요. 공유 PC에서는 사용 후 개인정보가 남을 수 있으니 주의해 주세요.</p></section>
+ </div><p class="settings-warning">Google 로그인과 가족 연결이 완료되면 변경을 자동 동기화합니다. 연결 전 기록이나 다른 주소에서 만든 기록은 별도 백업·이전이 필요합니다. 저장된 브라우저 데이터나 Firebase 오프라인 캐시는 기기의 잠금을 해제한 사람에게 보일 수 있으니 공용 기기는 피하세요.</p></section>
  <section class="section-block"><h2>앱과 정보</h2><div class="panel settings-actions">
  ${settingsAction('install','phone','홈 화면에 설치하기','PC는 localhost, 휴대폰은 HTTPS 주소에서 설치해요.')}
  ${settingsAction('sources','shield','출처와 정정 기록','공식안·확정 제도·미확인 정보를 나눠 볼 수 있어요.')}
@@ -145,6 +174,7 @@ function render(){
   $('#main').innerHTML=(renderers[ui.view]||renderHome)();
   if(ui.view==='timeline')requestAnimationFrame(()=>{const wrap=$('.v2-months'),active=wrap?.querySelector('.active');if(wrap&&active)wrap.scrollLeft=Math.max(0,active.offsetLeft-wrap.offsetLeft-wrap.clientWidth/2+active.clientWidth/2);});
  document.title=`${({home:'지금 챙길 일',timeline:'우리 가족 일정',benefits:'혜택',events:'이벤트',settings:'설정',sources:'출처와 정정'})[ui.view]||'홈'} · CHECK`;
+ updateCloudPanel();
 }
 function openItem(id){
  const item=itemById(id);if(!item){toast('이 항목은 현재 데이터에서 찾지 못했어요.');return;}
@@ -199,6 +229,57 @@ function exportState(prefix='CHECK-backup'){download(`${prefix}-${today}.json`,J
 function toast(message,undo=false){clearTimeout(toastTimer);$('#toast').innerHTML=`<span>${esc(message)}</span>${undo?'<button data-action="undo">되돌리기</button>':''}`;$('#toast').hidden=false;toastTimer=setTimeout(()=>$('#toast').hidden=true,undo?6500:4500);}
 function refreshAfterChange({detail=false}={}){render();if(detail&&activeItemId&&$('#detail-dialog').open){const scroll=$('#detail-dialog').scrollTop;renderDetail(itemById(activeItemId));$('#detail-dialog').scrollTop=scroll;}}
 async function handleAction(action,button){
+ if(action==='cloud-login'){
+  if(!cloudClient){toast('Firebase 설정을 먼저 완료해 주세요.');return;}
+  try{await cloudClient.signIn();}catch(err){toast(err?.message||'Google 로그인에 실패했어요. 팝업·승인 도메인을 확인해 주세요.');}
+  return;
+ }
+ if(action==='cloud-signout'){
+  await cloudClient?.signOut();toast('Google 계정에서 로그아웃했어요. 이전 기기 기록은 별도로 보존됩니다.');return;
+ }
+ if(action==='cloud-create-confirm'){
+  utility('새 가족 공간을 만들까요?',`<p>현재 이 기기의 체크, 준비서류 상태, 개인 할 일, 가족 설정, 메모를 <strong>Firebase의 새 가족 공간</strong>에 복사합니다. 이후 초대받은 배우자와 공유할 수 있어요.</p><p>현재 CHECK 로컬 기록은 삭제하지 않으며, 별도 JSON 백업을 권장합니다. 주민번호·계좌번호·진단서 내용은 메모에 적지 마세요.</p>`,
+    '<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button" data-action="cloud-create">가족 만들기</button>');return;
+ }
+ if(action==='cloud-create'){
+  $('#utility-dialog').close();exportState('CHECK-before-family');
+  try{await cloudClient.createFamily();toast('가족 공간을 만들고 이 기기 기록을 연결했어요.');}
+  catch(err){toast(err?.message||'가족 공간 생성에 실패했어요. Firebase 규칙과 인터넷을 확인해 주세요.');}
+  return;
+ }
+ if(action==='cloud-invite'){
+  try{await cloudClient.createInvite();updateCloudPanel();toast('초대 링크가 만들어졌어요. 배우자에게만 전달하세요.');}
+  catch(err){toast(err?.message||'초대 링크를 만들지 못했어요.');}
+  return;
+ }
+ if(action==='cloud-copy-invite'){
+  try{await navigator.clipboard.writeText(cloudState.invitationUrl||'');toast('초대 링크를 복사했어요. 배우자에게만 보내세요.');}
+  catch{toast('복사가 안 되면 링크 입력란을 길게 눌러 복사해 주세요.');}
+  return;
+ }
+ if(action==='cloud-join'){
+  const raw=$('#cloud-invite-input')?.value||'';
+  if(!raw.trim()){toast('배우자에게 받은 초대 링크를 붙여넣어 주세요.');return;}
+  try{await cloudClient.joinFamily(raw);history.replaceState(null,'',location.pathname+'#settings');render();toast('부부 가족 공간에 연결됐어요.');}
+  catch(err){toast(err?.message||'가족 참여에 실패했어요. 초대 링크 만료·사용 여부를 확인해 주세요.');}
+  return;
+ }
+ if(action==='cloud-remove-confirm'){
+  utility('배우자 연결을 해제할까요?',`<p>상대 계정의 <strong>새로운 Firestore 접근권한</strong>을 해제합니다. 이미 배우자의 기기에 저장된 오프라인 기록까지 원격으로 삭제할 수는 없습니다.</p><p>기록을 공유하기 전 꼭 당사자 간에 확인해 주세요.</p>`,
+    '<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button" data-action="cloud-remove">연결 해제</button>');return;
+ }
+ if(action==='cloud-remove'){
+  $('#utility-dialog').close();
+  try{await cloudClient.removePartner();toast('배우자의 새 클라우드 접근을 해제했어요.');}catch(err){toast(err?.message||'연결 해제에 실패했어요.');}
+  return;
+ }
+ if(action==='cloud-import'){$('#import-file').value='';$('#import-file').click();return;}
+ if(action==='confirm-cloud-merge'&&pendingImport){
+  const legacy=pendingImport;pendingImport=null;$('#utility-dialog').close();
+  try{const result=await cloudClient.mergeLegacy(legacy);toast(`기존 기록에서 ${result.added}개를 가족 공간에 추가했어요. 이미 있던 항목은 바꾸지 않았어요.`);}
+  catch(err){toast(err?.message||'기록 병합 중 문제가 생겼어요. 기존 체크는 보존됩니다.');}
+  return;
+ }
  if(action==='mark-applied'){flushNotes();const saved=setCheck(activeItemId,{status:'applied'});refreshAfterChange({detail:true});toast(saved?'신청했어요로 기록했어요. 실제 접수 완료 여부는 기관에서 확인하세요.':'기기 저장이 되지 않았어요. 백업해 주세요.');return;}
  if(action==='toggle'){
   const item=itemById(button.dataset.id);if(!item)return;
@@ -235,7 +316,7 @@ async function handleAction(action,button){
  }
  if(action==='share-item'){
   const url=new URL(location.href);url.hash=`item/${activeItemId}`;
-  try{await navigator.clipboard.writeText(url.href);toast('항목 링크를 복사했어요. 다른 기기의 기록은 공유되지 않아요.');}catch{utility('항목 링크',`<p>다른 기기에서는 같은 배포 주소에 접근할 수 있어야 해요. 체크와 메모는 포함되지 않아요.</p><label class="field"><span>복사할 링크</span><input readonly value="${esc(url.href)}"></label>`);}
+  try{await navigator.clipboard.writeText(url.href);toast('항목 링크를 복사했어요. 링크에는 체크나 메모가 포함되지 않아요.');}catch{utility('항목 링크',`<p>다른 기기에서는 같은 배포 주소에 접근할 수 있어야 해요. 링크 자체에는 체크나 메모가 포함되지 않아요.</p><label class="field"><span>복사할 링크</span><input readonly value="${esc(url.href)}"></label>`);}
   return;
  }
  if(action==='update-check'){
@@ -243,11 +324,14 @@ async function handleAction(action,button){
   try{await registration.update();if(registration.waiting){waitingWorker=registration.waiting;$('#update-banner').hidden=false;toast('새 앱 버전을 적용할 수 있어요.');}else toast('앱 파일 업데이트를 확인했어요. 정책 정보가 자동으로 재조사되는 것은 아니에요.');}catch{toast('업데이트를 확인하지 못했어요. 인터넷 연결을 확인해 주세요.');}return;
  }
  if(action==='update'&&waitingWorker){flushNotes();reloadForUpdate=true;waitingWorker.postMessage({type:'SKIP_WAITING'});return;}
- if(action==='reset'){utility('기록을 초기화할까요?',`<p>이 브라우저에 저장된 가족 설정, 체크, 서류 준비 표시, 메모와 개인 할 일을 지워요. 혜택 원문 데이터는 그대로 남아요.</p><p>‘초기화’를 누르면 먼저 현재 기록의 백업 파일을 내려받습니다.</p>`,'<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button danger-button" data-action="confirm-reset">백업 후 초기화</button>');return;}
+ if(action==='reset'){
+  if(cloudClient?.familyId){toast('공유 중인 가족의 기록을 실수로 지우지 않도록 초기화를 제한했어요. 먼저 로그아웃해 기기별 기록을 정리하세요.');return;}
+  utility('기록을 초기화할까요?',`<p>이 브라우저에 저장된 가족 설정, 체크, 서류 준비 표시, 메모와 개인 할 일을 지워요. 혜택 원문 데이터는 그대로 남아요.</p><p>‘초기화’를 누르면 먼저 현재 기록의 백업 파일을 내려받습니다.</p>`,'<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button danger-button" data-action="confirm-reset">백업 후 초기화</button>');return;
+ }
  if(action==='confirm-reset'){if(corruptBackup)download(`CHECK-unreadable-${today}.txt`,corruptBackup,'text/plain');else exportState('CHECK-before-reset');state=freshState();corruptBackup='';storageError='';persist();$('#utility-dialog').close();render();toast('이 기기의 기록을 초기화했어요.');return;}
  if(action==='delete-custom'){utility('개인 할 일을 삭제할까요?',`<p>‘${esc(itemById(activeItemId)?.title)}’ 항목과 메모가 삭제됩니다.</p>`,'<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button danger-button" data-action="confirm-delete-custom">삭제</button>');return;}
  if(action==='confirm-delete-custom'){state.custom=state.custom.filter(c=>c.id!==activeItemId);delete state.checks[activeItemId];persist();$('#utility-dialog').close();$('#detail-dialog').close();render();toast('개인 할 일을 삭제했어요.');return;}
- if(action==='about'){utility('작지만, 중요한 기준',`<p>CHECK는 2026년 10월부터 2029년 12월까지의 신청 준비를 돕는 개인용 앱이에요. 공식기관·Toss와 제휴하지 않았어요.</p><h3>이 앱이 하는 일</h3><p>공개 자료의 출처와 조건을 정리하고, 날짜·지역별로 준비를 보여주며, 내 체크와 메모를 저장해요.</p><h3>이 앱이 하지 않는 일</h3><p>개인 자격 심사, 자동 신청, 계좌 조회, 실제 지급 확인, 자동 정책 업데이트, 기기 간 동기화, 서버 푸시는 하지 않아요. 서류를 업로드하지 않으며 외부 분석·광고 도구도 없어요.</p><h3>제작 과정에서 남은 한계</h3><p>${esc(data.meta.imageConcept)}</p><h3>의료·금융 판단</h3><p>검진·접종일과 근무 가능 여부는 의료진에게, 세금·대출·휴가 자격은 담당기관에 확인하세요. 앱의 일정은 법정 마감일을 확정하는 계산기가 아니에요.</p>`,'<button class="primary-button" data-action="close-utility">확인했어요</button>');}
+ if(action==='about'){utility('작지만, 중요한 기준',`<p>CHECK는 임신부터 육아까지의 신청 준비를 돕는 개인용 앱이에요. 공식기관·Toss와 제휴하지 않았어요.</p><h3>할 수 있는 일</h3><p>날짜·지역별 준비, 체크·서류·메모 저장, 공식 링크 확인, Google 로그인 후 부부 가족 공간 동기화(설정한 경우).</p><h3>하지 않는 일</h3><p>개인 자격 심사, 자동 정부 신청, 은행·보험 조회, 실제 지급 확인, 자동 정책 업데이트, 서버 푸시는 제공하지 않습니다.</p><h3>기기와 계정 주의</h3><p>클라우드를 연결하면 가족 프로필·메모가 Firebase에 저장되며 부부 모두 볼 수 있어요. 민감한 주민번호·계좌·진단서 정보는 입력하지 마세요. 기기의 오프라인 사본은 원격으로 삭제할 수 없습니다.</p><h3>의료·금융 판단</h3><p>검진·접종일과 근무 가능 여부는 의료진에게, 세금·대출·휴가 자격은 담당기관에 확인하세요.</p>`,'<button class="primary-button" data-action="close-utility">확인했어요</button>');}
 }
 function flushNotes(){
  clearTimeout(notesTimer);const el=$('#item-notes');
@@ -296,7 +380,11 @@ $('#import-file').addEventListener('change',async e=>{
  if(file.size>3*1024*1024){toast('백업 파일은 3MB 이하만 읽을 수 있어요.');return;}
  try{
   const parsed=JSON.parse(await file.text());pendingImport=sanitizeState(parsed);
-  utility('백업으로 기록을 바꿀까요?',`<p>선택한 파일의 설정과 ${Object.keys(pendingImport.checks).length}개 체크 기록, 개인 할 일 ${pendingImport.custom.length}개를 불러옵니다.</p><p>현재 기록과 자동 병합하지 않아요. 지금 기록은 교체 전에 별도의 백업 파일로 내려받습니다.</p><div class="utility-info">백업에는 가족 정보와 메모가 포함될 수 있어요. 본인이 신뢰하는 CHECK 파일만 불러오세요.</div>`,'<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button" data-action="confirm-import">백업 후 불러오기</button>');
+  if(cloudClient?.familyId){
+    utility('기존 기록을 가족 공간에 추가할까요?',`<p>체크 기록 ${Object.keys(pendingImport.checks).length}개와 개인 할 일 ${pendingImport.custom.length}개가 있는 파일입니다.</p><p><strong>클라우드에 없는 항목만 추가합니다.</strong> 배우자가 이미 작성한 체크·메모는 덮어쓰지 않고, 가족 프로필도 자동 변경하지 않습니다.</p><div class="utility-info">보내기 전에 민감한 메모가 있는지 확인해 주세요. 항목별 작성 내용은 부부 모두 볼 수 있습니다.</div>`,'<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button" data-action="confirm-cloud-merge">없는 항목만 추가</button>');
+  }else{
+    utility('백업으로 기록을 바꿀까요?',`<p>선택한 파일의 설정과 ${Object.keys(pendingImport.checks).length}개 체크 기록, 개인 할 일 ${pendingImport.custom.length}개를 불러옵니다.</p><p>현재 기록과 자동 병합하지 않아요. 지금 기록은 교체 전에 별도의 백업 파일로 내려받습니다.</p><div class="utility-info">백업에는 가족 정보와 메모가 포함될 수 있어요. 본인이 신뢰하는 CHECK 파일만 불러오세요.</div>`,'<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button" data-action="confirm-import">백업 후 불러오기</button>');
+  }
  }catch{pendingImport=null;toast('올바른 CHECK 백업 파일이 아니에요. 기존 기록은 바꾸지 않았어요.');}
 });
 for(const name of ['detail-dialog','utility-dialog']){
@@ -305,12 +393,67 @@ for(const name of ['detail-dialog','utility-dialog']){
  dialog.addEventListener('cancel',()=>{if(name==='detail-dialog')flushNotes();});
  dialog.addEventListener('close',()=>{let closedId='';if(name==='detail-dialog'){flushNotes();closedId=activeItemId;activeItemId='';if(location.hash===`#item/${closedId}`)history.replaceState(null,'',`${location.pathname}${location.search}#benefits`);render();}if(lastFocus?.isConnected)lastFocus.focus({preventScroll:true});else if(closedId)document.querySelector(`[data-open="${CSS.escape(closedId)}"]`)?.focus({preventScroll:true});});
 }
-function network(){const el=$('#network-status');el.textContent=navigator.onLine?'내 기기에 저장':'오프라인';el.classList.toggle('offline',!navigator.onLine);}
+function activateCloudFamily(familyId,seedLegacy){
+ flushNotes();
+ const legacy=cloneState(state);
+ currentStorageKey=familyStorageKey(familyId);
+ storageError='';corruptBackup='';
+ const existing=readState(currentStorageKey);
+ let hasStored=false;
+ try{hasStored=!!localStorage.getItem(currentStorageKey);}catch{}
+ state=hasStored?existing:seedLegacy?legacy:freshState();
+ lastSavedState=cloneState(state);
+ persist({remote:true});rebuild();render();
+}
+function leaveCloudFamily(){
+ flushNotes();currentStorageKey=STORAGE_KEY;storageError='';corruptBackup='';
+ state=readState();lastSavedState=cloneState(state);rebuild();render();
+}
+function receiveCloudMessage(change){
+ if(!cloudClient?.familyId)return;
+ if(change.type==='profile'){state.profile=sanitizeProfile(change.value);}
+ if(change.type==='check'){
+  if(document.activeElement?.id==='item-notes'&&activeItemId===change.id)return;
+  state.checks[change.id]=change.value;
+ }
+ if(change.type==='custom'){
+  state.custom=state.custom.filter(v=>v.id!==change.id);
+  if(change.value)state.custom.push(change.value);
+ }
+ persist({remote:true});rebuild();
+ if(!$('#detail-dialog').open)render();
+ else if(document.activeElement?.id!=='item-notes'&&activeItemId===change.id)renderDetail(itemById(change.id));
+}
+async function initCloud(){
+ const config=window.CHECK_FIREBASE_CONFIG;
+ cloudState.configured=validConfig(config);
+ if(!cloudState.configured){updateCloudPanel();return;}
+ try{
+  const mod=await import('./cloud-sync.bundle.js');
+  cloudClient=mod.createFamilyCloud(config,{
+   getState:()=>cloneState(state),
+   activateFamily:activateCloudFamily,leaveFamily:leaveCloudFamily,
+   onRemote:receiveCloudMessage,
+   onStatus:next=>{cloudState={...cloudState,...next};updateCloudPanel();},
+   onError:message=>toast(message)
+  });
+ }catch(err){
+  console.error('Cloud SDK initialization error',err);
+  cloudState.phase='error';cloudState.detail='Firebase 연결 모듈을 시작하지 못했어요. 설정과 접속 도메인을 확인해 주세요.';
+  updateCloudPanel();
+ }
+}
+function network(){
+ const el=$('#network-status');
+ if(cloudState.familyId)el.textContent=navigator.onLine?(cloudState.pending?'가족 동기화 중':'가족 자동 동기화'):'오프라인 · 재연결 대기';
+ else el.textContent=navigator.onLine?'내 기기에 저장':'오프라인';
+ el.classList.toggle('offline',!navigator.onLine);
+}
 window.addEventListener('online',network);window.addEventListener('offline',network);
 window.addEventListener('hashchange',route);
 window.addEventListener('beforeunload',flushNotes);
 window.addEventListener('pagehide',flushNotes);
-window.addEventListener('storage',e=>{if(e.key!==STORAGE_KEY||!e.newValue||$('#detail-dialog').open)return;try{state=sanitizeState(JSON.parse(e.newValue));render();toast('다른 탭의 기록 변경을 반영했어요.');}catch{toast('다른 탭의 기록을 읽지 못했어요. 새로고침 전에 백업해 주세요.');}});
+window.addEventListener('storage',e=>{if(e.key!==currentStorageKey||!e.newValue||$('#detail-dialog').open)return;try{state=sanitizeState(JSON.parse(e.newValue));lastSavedState=cloneState(state);render();toast('다른 탭의 기록 변경을 반영했어요.');}catch{toast('다른 탭의 기록을 읽지 못했어요. 새로고침 전에 백업해 주세요.');}});
 window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredInstall=e;});
 window.addEventListener('appinstalled',()=>{deferredInstall=null;toast('CHECK를 설치했어요. 중요한 기록은 정기적으로 백업해 주세요.');});
 async function registerSW(){
@@ -327,8 +470,9 @@ async function boot(){
  try{
   const response=await fetch('./data.json');if(!response.ok)throw Error(`HTTP ${response.status}`);data=await response.json();
   if(!Array.isArray(data.items)||!Array.isArray(data.sources))throw Error('Data schema missing');
-  state=readState();rebuild();route();$('#footer-meta').textContent=`정보 확인일 ${data.meta.checkedAt.replaceAll('-','.')} · 실제 신청·선정은 해당 기관에서`;
+  state=readState();lastSavedState=cloneState(state);rebuild();route();$('#footer-meta').textContent=`정보 확인일 ${data.meta.checkedAt.replaceAll('-','.')} · 실제 신청·선정은 해당 기관에서`;
   await registerSW();
+  await initCloud();
  }catch(err){
   console.error(err);$('#main').innerHTML=`<div class="loading"><span class="loading-check">!</span><h1>체크리스트를 열지 못했어요</h1><p>CHECK 폴더의 START_CHECK.cmd를 실행한 다음<br>http://localhost:4317 주소로 접속해 주세요.</p><p>HTML 파일을 더블클릭하는 file:// 방식은 지원하지 않아요.<br>오프라인 첫 방문이라면 먼저 인터넷 연결 상태에서 한 번 열어 주세요.</p><button class="primary-button" id="retry-load">다시 열기</button></div>`;$('#retry-load').onclick=()=>location.reload();
  }
