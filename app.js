@@ -60,7 +60,17 @@ function persist({remote=false}={}){
   return true;
  }catch{storageError='기기 저장에 실패했어요. 용량·비공개 모드를 확인하고 JSON 백업을 내려받아 주세요.';toast(storageError);return false;}
 }
-function setCheck(id,patch){state.checks[id]={...checkFor(state,id),...patch};const saved=persist();rebuild();return saved;}
+function setCheck(id,patch){
+ state.checks[id]={...checkFor(state,id),...patch};
+ const saved=persist();
+ // The device write has finished even if computing the large timeline takes
+ // longer. Update the note confirmation before that rebuild, including offline.
+ if(Object.prototype.hasOwnProperty.call(patch,'notes')){
+  const label=$('#note-save-status');
+  if(label)label.textContent=saved?'이 기기에 저장했어요':'저장에 실패했어요. JSON 백업을 내려받아 주세요.';
+ }
+ rebuild();return saved;
+}
 function itemById(id){return allItems.find(i=>i.id===id);}
 function navHTML(){return NAV.map(([key,ic,title])=>`<button type="button" class="nav-button${ui.view===key?' active':''}" data-view="${key}" ${ui.view===key?'aria-current="page"':''}>${icon(ic)}<span>${title}</span></button>`).join('');}
 function refreshNav(){ $('#desktop-nav').innerHTML=navHTML();$('#mobile-nav').innerHTML=navHTML(); }
