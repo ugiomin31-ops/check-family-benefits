@@ -1,0 +1,23 @@
+{
+  "id": "./",
+  "name": "CHECK · 우리 가족의 시작",
+  "short_name": "CHECK",
+  "description": "임신부터 육아까지, 혜택과 신청 준비를 한곳에서 챙기는 개인용 체크리스트",
+  "lang": "ko-KR",
+  "dir": "ltr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f5f6f8",
+  "theme_color": "#3182f6",
+  "categories": ["productivity", "lifestyle"],
+  "icons": [
+    { "src": "./icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "우리 가족 일정", "short_name": "일정", "url": "./#timeline" },
+    { "name": "신청할 혜택", "short_name": "혜택", "url": "./#benefits" }
+  ]
+}
