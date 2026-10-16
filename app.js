@@ -1,6 +1,7 @@
 import {homeV2,timelineV2,rowV2,badgeV2,cardV2,detailV2} from './ui-v2.js';
 import {VERSION,STORAGE_KEY,CHECKED_AT,RANGE,REGIONS,STATUS,EVIDENCE,DEFAULT_PROFILE,parseDate,addDays,addMonths,todayKST,monthLabel,dateLabel,fullDateLabel,monthsInRange,safeURL,sanitizeProfile,sanitizeState,freshState,checkFor,materializeItems,isOpen,rankItems,matchesSearch,buildICS} from './engine.js';
 import {validConfig,familyStorageKey,familyDiff,legacyMissing} from './cloud-logic.js';
+import {PREFERENCES_KEY,normalizePreferences,selectLibrary,connectionStatus} from './experience.js';
 
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -32,17 +33,28 @@ const paths={
  lock:'M5 10h14v11H5ZM8 10V6a4 4 0 1 1 8 0v4M12 14v3',
  minus:'M5 12h14',
  spark:'m12 2 2.8 7.2L22 12l-7.2 2.8L12 22l-2.8-7.2L2 12l7.2-2.8L12 2Z',
+ star:'m12 3 2.8 5.7 6.3.9-4.6 4.5 1.1 6.3L12 17.4 6.4 20.4l1.1-6.3L3 9.6l6.2-.9L12 3Z',
 };
 const icon=(name,cls='')=>`<svg viewBox="0 0 24 24" aria-hidden="true"${cls?` class="${esc(cls)}"`:''}><path d="${paths[name]||paths.doc}"/></svg>`;
 const categoryIcon=c=>/의료|건강|임신|출산/.test(c)?'heart':/직장|고용|휴직/.test(c)?'briefcase':/교통/.test(c)?'train':/세금|주거/.test(c)?'home':/지역/.test(c)?'location':/이벤트/.test(c)?'gift':/수당|급여|생활비|지원금/.test(c)?'card':/돌봄|보육/.test(c)?'baby':/점검/.test(c)?'refresh':'doc';
 const NAV=[['home','home','홈'],['timeline','calendar','일정'],['benefits','heart','혜택'],['events','gift','이벤트'],['settings','settings','설정']];
-let data,state,allItems=[],storageError='',corruptBackup='',activeItemId='',lastFocus=null,toastTimer,notesTimer,undoState=null,deferredInstall=null,registration=null,waitingWorker=null,reloadForUpdate=false,pendingImport=null;
+let data,state,allItems=[],storageError='',corruptBackup='',activeItemId='',lastFocus=null,toastTimer,notesTimer,undoState=null,deferredInstall=null,registration=null,waitingWorker=null,reloadForUpdate=false,pendingImport=null,pendingPreferences=null,preferencesError='';
 let currentStorageKey=STORAGE_KEY,lastSavedState=null,cloudClient=null;
 let cloudState={configured:false,phase:'setup',email:'',familyId:'',members:0,pending:0,owner:false,invitationUrl:'',detail:'Firebase 프로젝트 연결 전'};
 const cloneState=v=>JSON.parse(JSON.stringify(v));
 const today=todayKST();
 const within=m=>m<RANGE.start?RANGE.start:m>RANGE.end?RANGE.end:m;
-const ui={view:'home',month:within(today.slice(0,7)),year:within(today.slice(0,7)).slice(0,4),category:'전체',query:'',status:'all',mineOnly:false,hideComplete:false,sourceQuery:'',information:'all',timelineEvents:false};
+const ui={view:'home',month:within(today.slice(0,7)),year:within(today.slice(0,7)).slice(0,4),category:'전체',query:'',status:'all',mineOnly:false,favoritesOnly:false,sort:'priority',hideComplete:false,sourceQuery:'',information:'all',timelineEvents:false};
+let preferences=readPreferences();
+
+function readPreferences(){
+ try{const raw=localStorage.getItem(PREFERENCES_KEY);return normalizePreferences(raw?JSON.parse(raw):{});}
+ catch{preferencesError='이 기기의 즐겨찾기 설정을 읽지 못했어요. 기존 체크·메모는 별도 보관됩니다.';return normalizePreferences();}
+}
+function savePreferences(){
+ try{localStorage.setItem(PREFERENCES_KEY,JSON.stringify(preferences));preferencesError='';return true;}
+ catch{preferencesError='즐겨찾기 설정을 기기에 저장하지 못했어요. 현재 창에서만 유지됩니다.';return false;}
+}
 
 function readState(key=currentStorageKey){
  try{const raw=localStorage.getItem(key);if(!raw)return freshState();try{return sanitizeState(JSON.parse(raw));}catch{corruptBackup=raw;storageError='저장된 기록을 읽지 못했어요. 기존 기록은 덮어쓰지 않았습니다. 설정에서 원본을 백업하고 초기화해 주세요.';return freshState();}}
@@ -54,11 +66,13 @@ function persist({remote=false}={}){
  if(corruptBackup)return false;
  try{
   localStorage.setItem(currentStorageKey,JSON.stringify(state));
+  storageError='';
   const previous=lastSavedState;
   lastSavedState=cloneState(state);
   if(!remote&&cloudClient?.familyId&&previous)cloudClient.syncChanges(familyDiff(previous,state));
+  network();
   return true;
- }catch{storageError='기기 저장에 실패했어요. 용량·비공개 모드를 확인하고 JSON 백업을 내려받아 주세요.';toast(storageError);return false;}
+ }catch{storageError='기기 저장에 실패했어요. 용량·비공개 모드를 확인하고 JSON 백업을 내려받아 주세요.';network();toast(storageError);return false;}
 }
 function setCheck(id,patch){
  state.checks[id]={...checkFor(state,id),...patch};
@@ -76,17 +90,18 @@ function navHTML(){return NAV.map(([key,ic,title])=>`<button type="button" class
 function refreshNav(){ $('#desktop-nav').innerHTML=navHTML();$('#mobile-nav').innerHTML=navHTML(); }
 function route(){
  const hash=location.hash.slice(1);
- if(hash.startsWith('join/')){ui.view='settings';render();return;}
- if(hash.startsWith('item/')){ui.view='benefits';render();openItem(decodeURIComponent(hash.slice(5)));return;}
- if(hash==='sources'){ui.view='sources';render();return;}
- if(NAV.some(n=>n[0]===hash)){ui.view=hash;render();return;}
+ if(hash.startsWith('join/')){ui.view='settings';renderRoute();return;}
+ if(hash.startsWith('item/')){ui.view='benefits';renderRoute();openItem(decodeURIComponent(hash.slice(5)));return;}
+ if(hash==='sources'){ui.view='sources';renderRoute();return;}
+ if(NAV.some(n=>n[0]===hash)){ui.view=hash;renderRoute();return;}
  if(hash==='main')return;
- ui.view='home';render();
+ ui.view='home';renderRoute();
 }
+function renderRoute(){render();window.scrollTo({top:0,behavior:'instant'});$('#main').focus({preventScroll:true});}
 function go(view){
  if($('#detail-dialog').open)$('#detail-dialog').close();
  if($('#utility-dialog').open)$('#utility-dialog').close();
- if(location.hash===`#${view}`){ui.view=view;render();}else location.hash=view;
+ if(location.hash===`#${view}`){ui.view=view;renderRoute();}else location.hash=view;
  window.scrollTo({top:0,behavior:'instant'});
 }
 function badge(item){return badgeV2(item,{esc,icon});}
@@ -95,23 +110,26 @@ function row(item,options={}){return rowV2(item,{esc,icon,badge,...options});}
 function empty(title,message,button=''){return `<div class="empty"><div class="empty-icon">${icon('check')}</div><h3>${esc(title)}</h3><p>${esc(message)}</p>${button}</div>`;}
 function heading(eyebrow,title,subtitle,action=''){return `<div class="page-heading"><div><div class="eyebrow">${esc(eyebrow)}</div><h1>${title}</h1><p class="subtitle">${subtitle}</p></div>${action}</div>`;}
 function familySummary(){return state.profile.birthDate?`아기가 태어난 날 ${esc(state.profile.birthDate.replaceAll('-','.'))}`:`출산 예정 ${esc(state.profile.dueDate?state.profile.dueDate.replaceAll('-','.') : state.profile.dueMonth.replace('-','.'))}`;}
-function v2Context(){return {items:allItems,state,data,ui,month:within(today.slice(0,7)),today,esc,icon,row,badge,categoryIcon,externalLink,storageError};}
+function v2Context(){return {items:allItems,state,data,ui,preferences,month:within(today.slice(0,7)),today,esc,icon,row,badge,categoryIcon,externalLink,storageError};}
 function renderHome(){return homeV2(v2Context());}
 function renderTimeline(){return timelineV2(v2Context());}
 function card(item){return cardV2(item,v2Context());}
 function libraryCandidates(events=false){return allItems.filter(i=>events?i.kind==='event':['benefit','custom'].includes(i.kind));}
-function filteredLibrary(events=false){return libraryCandidates(events).filter(i=>
- (ui.category==='전체'||i.category===ui.category)&&matchesSearch(i,ui.query)&&(!ui.mineOnly||i.forMyTimeline)&&
- (ui.information==='all'||i.status===ui.information)&&
- (ui.status==='all'||(ui.status==='open'?isOpen(i):i.check.status===ui.status))
- );}
-function libraryBody(events=false){const list=filteredLibrary(events);return `<div class="result-count"><span>${list.length}개 ${events?'행사·프로젝트':'혜택·할 일'}</span><label class="mini-check"><input id="mine-only" type="checkbox"${ui.mineOnly?' checked':''}>전국 + 내 지역만</label></div><div class="library-grid">${list.length?list.map(card).join(''):empty('조건에 맞는 항목이 없어요','검색어를 짧게 바꾸거나 지역·분류 필터를 풀어 보세요.')}</div>`;}
+function filteredLibrary(events=false){return selectLibrary(libraryCandidates(events),ui,preferences.favorites);}
+function libraryBody(events=false){
+ const list=filteredLibrary(events);
+ return `<div class="result-count"><span role="status" aria-live="polite" aria-atomic="true">${list.length}개 ${events?'행사·프로젝트':'혜택·할 일'}</span><div class="v3-result-options"><label class="mini-check"><input id="mine-only" type="checkbox"${ui.mineOnly?' checked':''}>내 가족 조건에 맞게</label><label class="mini-check"><input id="favorites-only" type="checkbox"${ui.favoritesOnly?' checked':''}>즐겨찾기만</label><button class="text-button" data-action="reset-filters">필터 초기화</button></div></div>${ui.favoritesOnly?'<p class="v3-filter-hint">이 기기의 즐겨찾기만 표시해요.</p>':''}${preferencesError?`<p class="v3-filter-error" role="alert">${esc(preferencesError)}</p>`:''}<div class="library-grid">${list.length?list.map(card).join(''):empty('조건에 맞는 항목이 없어요',ui.favoritesOnly?'즐겨찾기가 없거나 필터 조건에 맞지 않아요.':'검색어 또는 필터를 바꿔보세요.','<button class="secondary-button" data-action="reset-filters">전체 항목 다시 보기</button>')}</div>`;
+}
+function updateLibrary(focusSelector=''){
+ $('#library-results').innerHTML=libraryBody(ui.view==='events');
+ if(focusSelector)$(focusSelector)?.focus({preventScroll:true});
+}
 function renderLibrary(events=false){
  const categories=['전체',...new Set(libraryCandidates(events).map(i=>i.category))];
  if(!categories.includes(ui.category))ui.category='전체';
- return heading(events?'A LITTLE EXTRA':'BENEFITS, WITH EVIDENCE',events?'작은 선물도 챙겨요':'받을 수 있는 혜택',events?'기관의 프로젝트와 기업의 체험·사은 행사를 모았어요.':'지원 내용보다 중요한 신청 조건과 방법까지.<br>2027~2029 금액은 신청연도에 다시 확인해 주세요.')+
- (events?`<div class="event-intro"><h3>‘무료’보다 먼저, 참여 조건을 봐주세요</h3><p>추첨·배송비·구매조건·마케팅 동의를 확인해요. 과거 행사와 현재 모집은 다릅니다. 앱에 ‘다시 확인’으로 표시한 행사는 신청 당일 공고 확인이 필요해요.</p></div>`:'')+
- `<div class="toolbar"><label class="searchbox"><span class="screen-reader">${events?'행사':'혜택'} 검색</span>${icon('search')}<input id="benefit-search" type="search" value="${esc(ui.query)}" placeholder="${events?'박스, 교육, 체험…':'국민행복카드, 산후도우미, 육아휴직…'}" autocomplete="off"></label><label><span class="screen-reader">진행상태 필터</span><select class="filter-select" id="status-filter">${[['all','모든 상태'],['open','아직 준비할 것'],['todo','준비 전'],['doing','준비 중'],['applied','신청했어요'],['done','챙겼어요'],['na','해당 없음']].map(([v,l])=>`<option value="${v}"${ui.status===v?' selected':''}>${l}</option>`).join('')}</select></label></div>
+ return heading(events?'선택 행사':'지원·신청 안내',events?'행사·이벤트':'받을 수 있는 혜택',events?'현재 모집 여부는 주최사 공고를 확인하세요.':'신청 조건과 금액은 신청연도 공고를 확인하세요.')+
+ (events?`<div class="event-intro"><h3>참여 조건부터 확인하세요</h3><p>추첨·배송비·구매조건·마케팅 동의를 확인하세요.</p></div>`:'')+
+ `<div class="toolbar"><label class="searchbox"><span class="screen-reader">${events?'행사':'혜택'} 검색</span>${icon('search')}<input id="benefit-search" type="search" value="${esc(ui.query)}" placeholder="${events?'박스, 교육, 체험…':'국민행복카드, 산후도우미, 육아휴직…'}" autocomplete="off"></label><label class="v3-filter-label"><span>진행상태</span><select class="filter-select" id="status-filter" aria-label="진행상태 필터">${[['all','모든 상태'],['open','아직 준비할 것'],['todo','준비 전'],['doing','준비 중'],['applied','신청했어요'],['done','챙겼어요'],['na','해당 없음']].map(([v,l])=>`<option value="${v}"${ui.status===v?' selected':''}>${l}</option>`).join('')}</select></label><label class="v3-filter-label"><span>정렬</span><select class="filter-select" id="sort-filter">${options({priority:'중요한 준비순',date:'준비일순',title:'이름순'},ui.sort)}</select></label></div>
  ${!events?`<div class="filter-strip" role="group" aria-label="혜택 분류">${categories.map(c=>`<button class="filter-chip${ui.category===c?' active':''}" data-category="${esc(c)}" aria-pressed="${ui.category===c}">${esc(c)}</button>`).join('')}</div>`:''}
  <div class="filter-strip" role="group" aria-label="정보 상태"><span class="v2-filter-label">정보 상태</span>${[['all','전체'],['current','현행 안내'],['conditional','조건부'],['future-check','새 공고·미확정'],['ended','종료 회차'],['unverified','미확인']].map(([v,l])=>`<button class="filter-chip${ui.information===v?' active':''}" data-information="${v}" aria-pressed="${ui.information===v}">${l}</button>`).join('')}</div><div id="library-results">${libraryBody(events)}</div>`;
 }
@@ -122,13 +140,16 @@ function cloudPanel(){
  const help='<a href="https://console.firebase.google.com/" target="_blank" rel="noopener noreferrer">Firebase 콘솔 열기 ↗</a>';
  if(!c.configured)return `<div class="cloud-stack"><span class="pill amber">초기 설정 필요</span><h3>부부 자동 동기화를 준비했어요</h3><p>GitHub Pages 앱은 사용 가능하며, Firebase 프로젝트의 웹 설정을 넣으면 각자 Google 로그인과 가족 공유가 활성화돼요.</p><p>설치 설명: <strong>FIREBASE_SETUP.md</strong> · ${help}</p><div class="cloud-note">Firebase 연결 전에도 기존 CHECK 기록은 이 브라우저에 그대로 저장됩니다. 비밀번호나 서비스 계정 키를 GitHub에 올리지 마세요.</div></div>`;
  if(c.phase==='auth-loading')return '<p>Google 로그인 상태를 확인하고 있어요…</p>';
- if(c.phase==='signed-out'||c.phase==='error')return `<div class="cloud-stack"><span class="pill blue">보호되는 가족 공간</span><h3>Google 계정으로 가족 기록 연결</h3><p>부부가 서로 다른 Google 계정으로 로그인한 후 초대 링크로 하나의 체크리스트를 공유할 수 있어요.</p><button class="primary-button" data-action="cloud-login">${icon('lock')} Google 계정으로 로그인</button><small>Google 로그인을 선택하면 Firebase 인증으로 연결됩니다. 가족 정보와 메모는 가족 구성원에게만 공개되며 일반 웹 방문자에게는 공개하지 않습니다.</small></div>`;
+ if(c.phase==='signed-out'||(c.phase==='error'&&!c.email&&!c.familyId))return `<div class="cloud-stack"><span class="pill blue">보호되는 가족 공간</span><h3>Google 계정으로 가족 기록 연결</h3><p>부부가 서로 다른 Google 계정으로 로그인한 후 초대 링크로 하나의 체크리스트를 공유할 수 있어요.</p><button class="primary-button" data-action="cloud-login">${icon('lock')} Google 계정으로 로그인</button><small>Google 로그인을 선택하면 Firebase 인증으로 연결됩니다. 가족 정보와 메모는 가족 구성원에게만 공개되며 일반 웹 방문자에게는 공개하지 않습니다.</small></div>`;
  if(!c.familyId)return `<div class="cloud-stack"><span class="pill blue">로그인됨</span><strong>${esc(c.email||'Google 계정')}</strong><p>새 가족을 만들면 이 기기에 저장된 CHECK 기록을 첫 가족 기록으로 가져옵니다. 배우자는 받은 초대 링크로 참여합니다.</p><div class="cloud-buttons"><button class="primary-button" data-action="cloud-create-confirm">${icon('plus')} 현재 기록으로 가족 만들기</button><button class="secondary-button" data-action="cloud-signout">로그아웃</button></div><label class="field"><span>배우자에게 받은 초대 링크</span><input id="cloud-invite-input" type="text" autocomplete="off" spellcheck="false" placeholder="링크를 붙여넣어 주세요" value="${esc(location.hash.startsWith('#join/')?location.href:'')}"></label><button class="secondary-button" data-action="cloud-join">초대 링크로 가족 참여하기</button><div class="cloud-note">배우자 계정으로 참여하면 그 가족의 클라우드 기록을 불러옵니다. 현재 기기에 남아 있는 기존 기록은 별도로 보존하며 자동으로 덮어쓰거나 합치지 않습니다.</div></div>`;
  return `<div class="cloud-stack"><div class="cloud-connect-status"><span class="cloud-online-dot"></span><div><strong>우리 가족 체크리스트 연결됨</strong><small>${esc(c.email)} · ${c.members||1}/2명 · ${esc(c.detail||'연결됨')}</small></div></div><div class="cloud-buttons">${c.owner&&c.members<2?'<button class="primary-button" data-action="cloud-invite">배우자 초대 링크 만들기</button>':''}<button class="secondary-button" data-action="cloud-import">기존 기록에서 없는 항목 추가</button><button class="secondary-button" data-action="cloud-signout">로그아웃</button></div>${c.invitationUrl?`<label class="field"><span>48시간 유효한 일회용 초대 링크</span><input readonly id="cloud-invite-url" value="${esc(c.invitationUrl)}"></label><button class="secondary-button" data-action="cloud-copy-invite">${icon('download')} 초대 링크 복사</button>`:''}${c.owner&&c.members===2?'<button class="text-button" data-action="cloud-remove-confirm">배우자 연결 해제</button>':''}<div class="cloud-note">항목별 체크·메모·가족 설정을 자동 반영합니다. 인터넷이 끊기면 이 기기 기록을 사용하며 다시 연결되면 전송을 시도해요. 같은 항목을 동시에 수정하면 마지막으로 서버에 반영된 값이 남을 수 있어요. Google 로그인·브라우저 캐시는 신뢰할 수 있는 개인 기기에서만 사용하세요.</div></div>`;
 }
 function updateCloudPanel(){
  const area=$('#cloud-panel');
- if(area&&!(document.activeElement?.matches('input,textarea')&&document.activeElement.closest('#cloud-panel')))area.innerHTML=cloudPanel();
+ if(area&&!(document.activeElement?.matches('input,textarea')&&document.activeElement.closest('#cloud-panel'))){
+  const status=connectionStatus({online:navigator.onLine,storageError,cloud:cloudState});
+  area.innerHTML=`<div class="v3-cloud-state" data-tone="${status.tone}" role="status"><strong>${esc(status.label)}</strong><p>${esc(status.detail)}</p></div>`+cloudPanel();
+ }
  network();
  const sb=$('.sidebar-bottom strong'),hint=$('.sidebar-bottom p');
  if(sb)sb.textContent=cloudState.familyId?'부부 가족 공유 연결됨':'이 기기에 안전하게 준비';
@@ -137,34 +158,35 @@ function updateCloudPanel(){
 function renderSettings(){
  const p=state.profile;
  const work={unknown:'아직 설정하지 않음',employee:'일반 근로자 · 고용보험 확인',public:'공무원·교원·사학 등 별도 확인',self:'자영업·프리랜서 등',other:'그 밖의 경우'};
- return heading('YOUR SETTINGS','우리 가족에 맞게','부부 가족 공유를 설정하거나 기기별 기록을 백업할 수 있어요.<br>주민번호·계좌번호·증빙 파일은 입력하지 마세요.')+
- `<section class="section-block"><h2>부부 자동 동기화</h2><div class="panel panel-pad" id="cloud-panel">${cloudPanel()}</div></section>`+
+ return heading('설정','우리 가족에 맞게','주민번호·계좌번호·증빙 파일은 입력하지 마세요.')+
+ `<div class="v3-settings-intro"><p>예정일 · 거주지 · 가족 조건</p><button class="secondary-button" data-action="start-setup">3단계 간편 설정</button></div>`+
  `<section class="section-block"><h2>우리 가족 정보</h2><form id="profile-form" class="panel panel-pad"><div class="form-grid">
- <label class="field"><span>출산 예정월</span><input type="month" name="dueMonth" value="${esc(p.dueMonth)}" min="2026-01" max="2029-12" required><small>날짜를 모르면 월만 입력해도 돼요.</small></label>
- <label class="field"><span>정확한 출산 예정일 · 선택</span><input type="date" name="dueDate" value="${esc(p.dueDate)}" min="2026-01-01" max="2029-12-31"><small>입력하면 위 예정월도 함께 바뀌어요.</small></label>
- <label class="field"><span>실제 출생일 · 출산 후 입력</span><input type="date" name="birthDate" value="${esc(p.birthDate)}" min="2026-01-01" max="${today}"><small>입력 후 산후 일정이 자동 재계산돼요.</small></label>
+ <label class="field"><span>출산 예정월</span><input type="month" name="dueMonth" value="${esc(p.dueMonth)}" min="2026-01" max="2029-12" required></label>
+ <label class="field"><span>정확한 출산 예정일 · 선택</span><input type="date" name="dueDate" value="${esc(p.dueDate)}" min="2026-01-01" max="2029-12-31"></label>
+ <label class="field"><span>실제 출생일 · 출산 후 입력</span><input type="date" name="birthDate" value="${esc(p.birthDate)}" min="2026-01-01" max="${today}"></label>
  <label class="field"><span>주민등록 거주지역</span><select name="region">${options(REGIONS,p.region)}</select><small>직장 소재지가 아닌 실제 거주지 기준이에요.</small></label>
  <label class="field"><span>시·군·구 이름 · 선택</span><input name="district" maxlength="50" value="${esc(p.district)}" placeholder="예: 동두천시, 의정부시, 노원구"><small>지원금 자격을 자동 확정하지 않아요. 시군구 공고를 확인하세요.</small></label>
  <label class="field"><span>현재 지역 전입일 · 선택</span><input type="date" name="moveInDate" value="${esc(p.moveInDate)}" max="${today}"><small>서울 3개월·동두천 1년 등 계속 거주기간 확인에 사용해요.</small></label>
- <label class="field"><span>이번 아이의 출생순위</span><select name="childOrder">${options({unknown:'아직 설정하지 않음','1':'첫째','2':'둘째','3':'셋째 이상'},p.childOrder)}</select><small>사업마다 자녀 수 계산이 다를 수 있어요.</small></label>
- <label class="field"><span>단태아·다태아</span><select name="multiple">${options({unknown:'아직 설정하지 않음',single:'단태아',twins:'쌍둥이',more:'세쌍둥이 이상'},p.multiple)}</select><small>의료기관 확인 기준으로 입력해요.</small></label>
+ <label class="field"><span>이번 아이의 출생순위</span><select name="childOrder">${options({unknown:'아직 설정하지 않음','1':'첫째','2':'둘째','3':'셋째 이상'},p.childOrder)}</select></label>
+ <label class="field"><span>단태아·다태아</span><select name="multiple">${options({unknown:'아직 설정하지 않음',single:'단태아',twins:'쌍둥이',more:'세쌍둥이 이상'},p.multiple)}</select></label>
  <label class="field"><span>출산하는 부모의 고용형태</span><select name="motherWork">${options(work,p.motherWork)}</select></label>
  <label class="field"><span>배우자의 고용형태</span><select name="fatherWork">${options(work,p.fatherWork)}</select></label>
  <label class="field"><span>출산하는 부모의 육아휴직 시작 예정일</span><input name="motherLeaveStart" type="date" value="${esc(p.motherLeaveStart)}" min="2026-01-01" max="2030-12-31"><small>입력 시 회사 신청 준비일을 30일 전으로 계산해요.</small></label>
  <label class="field"><span>배우자의 육아휴직 시작 예정일</span><input name="fatherLeaveStart" type="date" value="${esc(p.fatherLeaveStart)}" min="2026-01-01" max="2030-12-31"><small>부모함께 특례의 준비 시점을 다시 계산해요.</small></label>
- </div><div class="form-foot"><p>예정일·출생일·휴직 시작일로 일정을 계산해요. 지역·다태아·고용형태에 명백히 맞지 않는 항목은 내 일정에서 제외하되 전체 혜택에서 볼 수 있어요. 기존 체크·메모와 해당 없음 표시는 바꾸지 않아요.</p><button class="primary-button" type="submit">우리 가족 정보 저장</button></div></form></section>
+ </div><div class="form-foot"><p>입력 정보로 맞춤 일정이 바뀌며, 체크·메모는 유지돼요.</p><button class="primary-button" type="submit">우리 가족 정보 저장</button></div></form></section>
+ <section class="section-block"><h2>부부 자동 동기화</h2><div class="panel panel-pad" id="cloud-panel">${cloudPanel()}</div></section>
  ${storageError?`<div class="info-card amber"><div class="info-icon">${icon('info')}</div><div><h3>저장 상태를 확인해 주세요</h3><p>${esc(storageError)}</p></div></div>`:''}
  <section class="section-block"><h2>기록과 백업</h2><div class="panel settings-actions">
- ${settingsAction('export','download','JSON 백업 내려받기','설정·체크·준비물·메모를 파일로 보관해요.')}
+ ${settingsAction('export','download','JSON 백업 내려받기','설정·체크·준비물·메모·기기별 즐겨찾기를 파일로 보관해요.')}
  ${settingsAction('import','upload','백업 불러오기','현재 기록을 자동 백업한 후 선택한 파일로 교체해요.')}
  ${settingsAction('calendar','calendar','캘린더에 일정 보내기','ICS 파일을 가져와 캘린더 앱에서 알림을 설정해요.')}
  ${settingsAction('add-custom','plus','내 할 일 추가','지역 창구에서 확인한 혜택이나 개인 준비를 추가해요.')}
  ${corruptBackup?settingsAction('export-corrupt','doc','읽지 못한 기존 기록 보관','초기화 전에 원본 저장값을 내려받아 주세요.'):''}
- </div><p class="settings-warning">Google 로그인과 가족 연결이 완료되면 변경을 자동 동기화합니다. 연결 전 기록이나 다른 주소에서 만든 기록은 별도 백업·이전이 필요합니다. 저장된 브라우저 데이터나 Firebase 오프라인 캐시는 기기의 잠금을 해제한 사람에게 보일 수 있으니 공용 기기는 피하세요.</p></section>
+ </div><details class="settings-warning"><summary>저장·공유 주의사항</summary><p>가족 연결 후 기록을 자동 공유해요. 기기·주소 변경 전 백업하세요. 기기 저장·캐시는 암호화 금고가 아니므로 공용 기기는 피하세요.</p></details></section>
  <section class="section-block"><h2>앱과 정보</h2><div class="panel settings-actions">
  ${settingsAction('install','phone','홈 화면에 설치하기','PC는 localhost, 휴대폰은 HTTPS 주소에서 설치해요.')}
  ${settingsAction('sources','shield','출처와 정정 기록','공식안·확정 제도·미확인 정보를 나눠 볼 수 있어요.')}
- ${settingsAction('update-check','refresh','앱 파일 업데이트 확인','정책 자동 검색이 아니에요. 배포된 새 앱 버전만 확인해요.')}
+ ${settingsAction('update-check','refresh','앱 파일 업데이트 확인','배포된 새 앱 버전 확인')}
  ${settingsAction('about','info','이 앱의 범위와 한계','실제 접수·선정·입금은 해당 기관에서 확인해요.')}
  ${settingsAction('reset','refresh','이 기기의 기록 초기화','확인 후 설정·체크·메모를 지워요. 먼저 백업하세요.')}
  </div></section>`;
@@ -179,17 +201,27 @@ function renderSources(){
 }
 function render(){
  if(!data)return;
+ const active=document.activeElement;
+ let focusSelector='';
+ if(active?.closest('#main')){
+  if(active.id)focusSelector='#'+CSS.escape(active.id);
+  else for(const name of ['data-category','data-information','data-year','data-month','data-action','data-open']){
+   if(active.hasAttribute(name)){focusSelector=`[${name}="${CSS.escape(active.getAttribute(name))}"]`;break;}
+  }
+ }
  rebuild();refreshNav();
  const renderers={home:renderHome,timeline:renderTimeline,benefits:()=>renderLibrary(false),events:()=>renderLibrary(true),settings:renderSettings,sources:renderSources};
   $('#main').innerHTML=(renderers[ui.view]||renderHome)();
   if(ui.view==='timeline')requestAnimationFrame(()=>{const wrap=$('.v2-months'),active=wrap?.querySelector('.active');if(wrap&&active)wrap.scrollLeft=Math.max(0,active.offsetLeft-wrap.offsetLeft-wrap.clientWidth/2+active.clientWidth/2);});
  document.title=`${({home:'지금 챙길 일',timeline:'우리 가족 일정',benefits:'혜택',events:'이벤트',settings:'설정',sources:'출처와 정정'})[ui.view]||'홈'} · CHECK`;
  updateCloudPanel();
+ if(focusSelector)$('#main').querySelector(focusSelector)?.focus({preventScroll:true});
 }
 function openItem(id){
  const item=itemById(id);if(!item){toast('이 항목은 현재 데이터에서 찾지 못했어요.');return;}
  activeItemId=id;lastFocus=document.activeElement;renderDetail(item);
  if(!$('#detail-dialog').open)$('#detail-dialog').showModal();
+ $('#detail-dialog').scrollTop=0;
 }
 function externalLink(l){
  const url=safeURL(l.url);if(!url)return '';
@@ -215,6 +247,40 @@ function utility(title,content,buttons=''){
  $('#utility-dialog').innerHTML=`<div class="dialog-top"><span class="tiny-label">CHECK</span><button class="icon-button" data-action="close-utility" aria-label="창 닫기">${icon('close')}</button></div><div class="utility-body"><h2 id="utility-title">${title}</h2>${content}${buttons?`<div class="utility-buttons">${buttons}</div>`:''}</div>`;
  if(!$('#utility-dialog').open)$('#utility-dialog').showModal();
 }
+function setupDialog(){
+ const p=state.profile;
+ utility('우리 가족 일정 맞추기',`
+ <ol class="v3-setup-progress" aria-label="설정 단계"><li class="active" aria-current="step">1. 예정일</li><li>2. 거주지</li><li>3. 가족 조건</li></ol>
+ <form id="setup-form" data-step="0">
+ <fieldset class="v3-setup-fieldset" data-setup-step="0"><legend>언제 만날 예정인가요?</legend>
+ <label class="field"><span>출산 예정월</span><input name="dueMonth" type="month" value="${esc(p.dueMonth)}" min="2026-01" max="2029-12" required></label>
+ <label class="field"><span>정확한 출산 예정일 · 선택</span><input name="dueDate" type="date" value="${esc(p.dueDate)}" min="2026-01-01" max="2029-12-31"></label>
+ <label class="field"><span>실제 출생일 · 출산 후 선택</span><input name="birthDate" type="date" value="${esc(p.birthDate)}" min="2026-01-01" max="${today}"></label>
+ <p class="v3-setup-help">예정월만 입력하면 임시 일정을 만들어요.</p></fieldset>
+ <fieldset class="v3-setup-fieldset" data-setup-step="1" hidden><legend>어느 지역에 살고 있나요?</legend>
+ <label class="field"><span>주민등록 거주지역</span><select name="region">${options(REGIONS,p.region)}</select></label>
+ <label class="field"><span>시·군·구 이름 · 선택</span><input name="district" maxlength="50" value="${esc(p.district)}" placeholder="예: 동두천시, 노원구"></label>
+ <p class="v3-setup-help">지역별 혜택을 찾는 데 사용해요.</p></fieldset>
+ <fieldset class="v3-setup-fieldset" data-setup-step="2" hidden><legend>맞춤 조건을 조금 더 알려주세요</legend>
+ <label class="field"><span>이번 아이의 출생순위 · 선택</span><select name="childOrder">${options({unknown:'아직 설정하지 않음','1':'첫째','2':'둘째','3':'셋째 이상'},p.childOrder)}</select></label>
+ <label class="field"><span>단태아·다태아 · 선택</span><select name="multiple">${options({unknown:'아직 설정하지 않음',single:'단태아',twins:'쌍둥이',more:'세쌍둥이 이상'},p.multiple)}</select></label>
+ <p class="v3-setup-help">고용형태·휴직일은 설정에서 나중에 추가하세요.</p></fieldset>
+ <div class="v3-setup-foot"><button type="button" class="text-button" data-action="setup-back" hidden>이전</button><div><button type="button" class="text-button" data-action="close-utility">나중에 할게요</button><button type="button" class="primary-button" data-action="setup-next">다음</button><button type="submit" class="primary-button" id="setup-finish" hidden>이 정보로 시작하기</button></div></div></form>`);
+}
+function moveSetup(delta){
+ const form=$('#setup-form'),current=Number(form.dataset.step);
+ if(delta>0){
+  for(const field of form.querySelector(`[data-setup-step="${current}"]`).querySelectorAll('input,select')){
+   if(!field.reportValidity())return;
+  }
+ }
+ const next=Math.max(0,Math.min(2,current+delta));form.dataset.step=next;
+ form.querySelectorAll('[data-setup-step]').forEach((field,i)=>field.hidden=i!==next);
+ document.querySelectorAll('.v3-setup-progress li').forEach((step,i)=>{step.classList.toggle('active',i===next);if(i===next)step.setAttribute('aria-current','step');else step.removeAttribute('aria-current');});
+ $('[data-action="setup-back"]').hidden=next===0;
+ $('[data-action="setup-next"]').hidden=next===2;$('#setup-finish').hidden=next!==2;
+ form.querySelector(`[data-setup-step="${next}"] input,[data-setup-step="${next}"] select`)?.focus();
+}
 function installGuide(){
  const secure=window.isSecureContext;
  utility('홈 화면에 CHECK를',`<p>자주 쓰는 앱처럼 꺼내 보세요. 처음 온라인으로 연 뒤에는 저장된 체크리스트를 오프라인에서도 사용할 수 있어요.</p>
@@ -235,10 +301,34 @@ function customDialog(){
 function download(name,text,mime='application/json'){
  const url=URL.createObjectURL(new Blob([text],{type:mime}));const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);
 }
-function exportState(prefix='CHECK-backup'){download(`${prefix}-${today}.json`,JSON.stringify({...state,exportedAt:new Date().toISOString(),app:'CHECK'},null,2));toast('백업 파일을 내려받았어요. 안전한 곳에 보관해 주세요.');}
+function exportState(prefix='CHECK-backup'){download(`${prefix}-${today}.json`,JSON.stringify({...state,preferences,exportedAt:new Date().toISOString(),app:'CHECK'},null,2));toast('백업 파일을 내려받았어요. 안전한 곳에 보관해 주세요.');}
 function toast(message,undo=false){clearTimeout(toastTimer);$('#toast').innerHTML=`<span>${esc(message)}</span>${undo?'<button data-action="undo">되돌리기</button>':''}`;$('#toast').hidden=false;toastTimer=setTimeout(()=>$('#toast').hidden=true,undo?6500:4500);}
 function refreshAfterChange({detail=false}={}){render();if(detail&&activeItemId&&$('#detail-dialog').open){const scroll=$('#detail-dialog').scrollTop;renderDetail(itemById(activeItemId));$('#detail-dialog').scrollTop=scroll;}}
 async function handleAction(action,button){
+ if(action==='start-setup'){setupDialog();return;}
+ if(action==='setup-next'){moveSetup(1);return;}
+ if(action==='setup-back'){moveSetup(-1);return;}
+ if(action==='previous-month'||action==='next-month'){
+  ui.month=within(addMonths(ui.month+'-01',action==='next-month'?1:-1).slice(0,7));ui.year=ui.month.slice(0,4);render();
+  $(`[data-action="${action}"]`)?.focus({preventScroll:true});return;
+ }
+ if(action==='reset-filters'){
+  Object.assign(ui,{category:'전체',query:'',status:'all',mineOnly:false,favoritesOnly:false,information:'all',sort:'priority'});render();$('#benefit-search')?.focus();return;
+ }
+ if(action==='open-favorites'){
+  Object.assign(ui,{category:'전체',query:'',status:'all',mineOnly:false,favoritesOnly:true,information:'all'});go('benefits');return;
+ }
+ if(action==='favorite'){
+  const id=button.dataset.id,had=preferences.favorites.includes(id);
+  preferences.favorites=had?preferences.favorites.filter(x=>x!==id):[...preferences.favorites,id];
+  const saved=savePreferences();
+  if($('#detail-dialog').open){
+   flushNotes();renderDetail(itemById(activeItemId));$('#detail-dialog [data-action="favorite"]').focus({preventScroll:true});
+  }else if(ui.view==='benefits'||ui.view==='events'){
+   updateLibrary();($(`[data-action="favorite"][data-id="${CSS.escape(id)}"]`)||$('#favorites-only'))?.focus({preventScroll:true});
+  }else render();
+  toast(saved?(had?'즐겨찾기에서 뺐어요.':'이 기기의 즐겨찾기에 추가했어요.'):preferencesError);return;
+ }
  if(action==='cloud-login'){
   if(!cloudClient){toast('Firebase 설정을 먼저 완료해 주세요.');return;}
   try{await cloudClient.signIn();}catch(err){toast(err?.message||'Google 로그인에 실패했어요. 팝업·승인 도메인을 확인해 주세요.');}
@@ -286,7 +376,7 @@ async function handleAction(action,button){
  if(action==='cloud-import'){$('#import-file').value='';$('#import-file').click();return;}
  if(action==='confirm-cloud-merge'&&pendingImport){
   const legacy=pendingImport;pendingImport=null;$('#utility-dialog').close();
-  try{const result=await cloudClient.mergeLegacy(legacy);toast(`기존 기록에서 ${result.added}개를 가족 공간에 추가했어요. 이미 있던 항목은 바꾸지 않았어요.`);}
+  try{const result=await cloudClient.mergeLegacy(legacy);if(pendingPreferences){preferences=normalizePreferences({favorites:[...preferences.favorites,...pendingPreferences.favorites],setupCompleted:preferences.setupCompleted||pendingPreferences.setupCompleted});savePreferences();pendingPreferences=null;}toast(`기존 기록에서 ${result.added}개를 가족 공간에 추가했어요. 이미 있던 항목은 바꾸지 않았어요.`);}
   catch(err){toast(err?.message||'기록 병합 중 문제가 생겼어요. 기존 체크는 보존됩니다.');}
   return;
  }
@@ -310,7 +400,7 @@ async function handleAction(action,button){
  if(action==='import'){$('#import-file').value='';$('#import-file').click();return;}
  if(action==='confirm-import'&&pendingImport){
   if(corruptBackup)download(`CHECK-before-restore-unreadable-${today}.txt`,corruptBackup,'text/plain');else exportState('CHECK-before-restore');
-  state=pendingImport;pendingImport=null;corruptBackup='';storageError='';const saved=persist();rebuild();$('#utility-dialog').close();render();toast(saved?'백업을 불러왔어요.':'불러왔지만 기기 저장에 실패했어요.');return;
+  state=pendingImport;pendingImport=null;if(pendingPreferences){preferences=pendingPreferences;pendingPreferences=null;savePreferences();}corruptBackup='';storageError='';const saved=persist();rebuild();$('#utility-dialog').close();render();toast(saved?'백업을 불러왔어요.':'불러왔지만 기기 저장에 실패했어요.');return;
  }
  if(action==='calendar'){flushNotes();calendarDialog();return;}
  if(action==='download-ics'){
@@ -338,7 +428,7 @@ async function handleAction(action,button){
   if(cloudClient?.familyId){toast('공유 중인 가족의 기록을 실수로 지우지 않도록 초기화를 제한했어요. 먼저 로그아웃해 기기별 기록을 정리하세요.');return;}
   utility('기록을 초기화할까요?',`<p>이 브라우저에 저장된 가족 설정, 체크, 서류 준비 표시, 메모와 개인 할 일을 지워요. 혜택 원문 데이터는 그대로 남아요.</p><p>‘초기화’를 누르면 먼저 현재 기록의 백업 파일을 내려받습니다.</p>`,'<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button danger-button" data-action="confirm-reset">백업 후 초기화</button>');return;
  }
- if(action==='confirm-reset'){if(corruptBackup)download(`CHECK-unreadable-${today}.txt`,corruptBackup,'text/plain');else exportState('CHECK-before-reset');state=freshState();corruptBackup='';storageError='';persist();$('#utility-dialog').close();render();toast('이 기기의 기록을 초기화했어요.');return;}
+ if(action==='confirm-reset'){if(corruptBackup)download(`CHECK-unreadable-${today}.txt`,corruptBackup,'text/plain');else exportState('CHECK-before-reset');state=freshState();preferences=normalizePreferences();savePreferences();corruptBackup='';storageError='';persist();$('#utility-dialog').close();render();toast('이 기기의 기록을 초기화했어요.');return;}
  if(action==='delete-custom'){utility('개인 할 일을 삭제할까요?',`<p>‘${esc(itemById(activeItemId)?.title)}’ 항목과 메모가 삭제됩니다.</p>`,'<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button danger-button" data-action="confirm-delete-custom">삭제</button>');return;}
  if(action==='confirm-delete-custom'){state.custom=state.custom.filter(c=>c.id!==activeItemId);delete state.checks[activeItemId];persist();$('#utility-dialog').close();$('#detail-dialog').close();render();toast('개인 할 일을 삭제했어요.');return;}
  if(action==='about'){utility('작지만, 중요한 기준',`<p>CHECK는 임신부터 육아까지의 신청 준비를 돕는 개인용 앱이에요. 공식기관·Toss와 제휴하지 않았어요.</p><h3>할 수 있는 일</h3><p>날짜·지역별 준비, 체크·서류·메모 저장, 공식 링크 확인, Google 로그인 후 부부 가족 공간 동기화(설정한 경우).</p><h3>하지 않는 일</h3><p>개인 자격 심사, 자동 정부 신청, 은행·보험 조회, 실제 지급 확인, 자동 정책 업데이트, 서버 푸시는 제공하지 않습니다.</p><h3>기기와 계정 주의</h3><p>클라우드를 연결하면 가족 프로필·메모가 Firebase에 저장되며 부부 모두 볼 수 있어요. 민감한 주민번호·계좌·진단서 정보는 입력하지 마세요. 기기의 오프라인 사본은 원격으로 삭제할 수 없습니다.</p><h3>의료·금융 판단</h3><p>검진·접종일과 근무 가능 여부는 의료진에게, 세금·대출·휴가 자격은 담당기관에 확인하세요.</p>`,'<button class="primary-button" data-action="close-utility">확인했어요</button>');}
@@ -351,20 +441,29 @@ document.addEventListener('click',e=>{
  const view=e.target.closest('[data-view]');if(view){ui.category='전체';ui.query='';ui.information='all';go(view.dataset.view);return;}
  const open=e.target.closest('[data-open]');if(open){openItem(open.dataset.open);return;}
  const action=e.target.closest('[data-action]');if(action){e.preventDefault();handleAction(action.dataset.action,action).catch(err=>{console.error(err);toast('처리하지 못했어요. 백업 후 다시 시도해 주세요.');});return;}
+ const section=e.target.closest('[data-home-section]');if(section){
+  const target=document.getElementById(section.dataset.homeSection);
+  if(target){if(target.tagName==='DETAILS')target.open=true;target.scrollIntoView({block:'start'});const heading=target.querySelector('h2,summary');heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});}
+  else toast('이 구분에 남아 있는 준비가 없어요.');return;
+ }
+ const detailSection=e.target.closest('[data-detail-section]');if(detailSection){const target=document.getElementById('detail-'+detailSection.dataset.detailSection);target?.scrollIntoView({block:'start'});target?.focus({preventScroll:true});return;}
  const year=e.target.closest('[data-year]');if(year){ui.year=year.dataset.year;const oldMonth=ui.month.slice(5);ui.month=within(`${ui.year}-${oldMonth}`);if(!ui.month.startsWith(ui.year))ui.month=monthsInRange().find(m=>m.startsWith(ui.year));render();return;}
  const month=e.target.closest('[data-month]');if(month){ui.month=month.dataset.month;render();return;}
  const info=e.target.closest('[data-information]');if(info){ui.information=info.dataset.information;render();return;}
  const category=e.target.closest('[data-category]');if(category){ui.category=category.dataset.category;render();return;}
- const status=e.target.closest('[data-item-status]');if(status){flushNotes();const saved=setCheck(activeItemId,{status:status.dataset.itemStatus});refreshAfterChange({detail:true});toast(saved?'진행상태를 저장했어요.':'기기 저장에 실패했어요. 백업해 주세요.');}
+ const status=e.target.closest('[data-item-status]');if(status){flushNotes();const value=status.dataset.itemStatus,saved=setCheck(activeItemId,{status:value});refreshAfterChange({detail:true});$(`[data-item-status="${value}"]`)?.focus({preventScroll:true});toast(saved?'진행상태를 저장했어요.':'기기 저장에 실패했어요. 백업해 주세요.');}
 });
 document.addEventListener('input',e=>{
- if(e.target.id==='benefit-search'){ui.query=e.target.value;$('#library-results').innerHTML=libraryBody(ui.view==='events');}
+ if(e.target.id==='benefit-search'){ui.query=e.target.value;updateLibrary();}
  if(e.target.id==='source-search'){ui.sourceQuery=e.target.value;$('#source-results').innerHTML=data.sources.filter(s=>matchesSearch({title:s.title,summary:s.publisher},ui.sourceQuery)).map(sourceCard).join('');}
  if(e.target.id==='item-notes'){clearTimeout(notesTimer);$('#note-save-status').textContent='저장 중…';notesTimer=setTimeout(()=>{const saved=setCheck(activeItemId,{notes:e.target.value.slice(0,4000)});const label=$('#note-save-status');if(label)label.textContent=saved?'이 기기에 저장했어요':'저장에 실패했어요. JSON 백업을 내려받아 주세요.';},350);}
 });
 document.addEventListener('change',e=>{
- if(e.target.id==='status-filter'){ui.status=e.target.value;$('#library-results').innerHTML=libraryBody(ui.view==='events');}
- if(e.target.id==='mine-only'){ui.mineOnly=e.target.checked;$('#library-results').innerHTML=libraryBody(ui.view==='events');}
+ if(e.target.id==='status-filter'){ui.status=e.target.value;updateLibrary();}
+ if(e.target.id==='sort-filter'){ui.sort=e.target.value;updateLibrary();}
+ if(e.target.id==='mine-only'){ui.mineOnly=e.target.checked;updateLibrary('#mine-only');}
+ if(e.target.id==='favorites-only'){ui.favoritesOnly=e.target.checked;updateLibrary('#favorites-only');}
+ if(e.target.id==='timeline-month'){if(e.target.validity.valid&&e.target.value){ui.month=within(e.target.value);ui.year=ui.month.slice(0,4);render();}}
  if(e.target.id==='timeline-events'){ui.timelineEvents=e.target.checked;render();}
  if(e.target.id==='hide-complete'){ui.hideComplete=e.target.checked;render();}
  if(e.target.hasAttribute('data-doc')){
@@ -373,6 +472,15 @@ document.addEventListener('change',e=>{
  if(e.target.id==='item-date'){const v=e.target.value;if(v&&!parseDate(v)){toast('올바른 날짜를 입력해 주세요.');return;}setCheck(activeItemId,{date:v});refreshAfterChange({detail:true});}
 });
 document.addEventListener('submit',e=>{
+ if(e.target.id==='setup-form'){
+  e.preventDefault();
+  if(Number(e.target.dataset.step)<2){moveSetup(1);return;}
+  const values=Object.fromEntries(new FormData(e.target));
+  if(values.birthDate&&values.birthDate>today){toast('실제 출생일은 출산 후 입력해 주세요.');return;}
+  state.profile=sanitizeProfile({...state.profile,...values});const saved=persist();
+  preferences.setupCompleted=true;savePreferences();$('#utility-dialog').close();render();
+  toast(saved?'우리 가족 일정이 준비됐어요. 기존 체크와 메모는 그대로예요.':'현재 창에 적용했어요. 저장에 실패했으니 JSON 백업을 내려받아 주세요.');return;
+ }
  if(e.target.id==='profile-form'){
   e.preventDefault();const values=Object.fromEntries(new FormData(e.target));
   if(values.birthDate&&values.birthDate>today){toast('실제 출생일은 출산 후 입력해 주세요.');return;}
@@ -389,13 +497,13 @@ $('#import-file').addEventListener('change',async e=>{
  const file=e.target.files[0];if(!file)return;
  if(file.size>3*1024*1024){toast('백업 파일은 3MB 이하만 읽을 수 있어요.');return;}
  try{
-  const parsed=JSON.parse(await file.text());pendingImport=sanitizeState(parsed);
+  const parsed=JSON.parse(await file.text());pendingImport=sanitizeState(parsed);pendingPreferences=parsed.preferences?normalizePreferences(parsed.preferences):null;
   if(cloudClient?.familyId){
     utility('기존 기록을 가족 공간에 추가할까요?',`<p>체크 기록 ${Object.keys(pendingImport.checks).length}개와 개인 할 일 ${pendingImport.custom.length}개가 있는 파일입니다.</p><p><strong>클라우드에 없는 항목만 추가합니다.</strong> 배우자가 이미 작성한 체크·메모는 덮어쓰지 않고, 가족 프로필도 자동 변경하지 않습니다.</p><div class="utility-info">보내기 전에 민감한 메모가 있는지 확인해 주세요. 항목별 작성 내용은 부부 모두 볼 수 있습니다.</div>`,'<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button" data-action="confirm-cloud-merge">없는 항목만 추가</button>');
   }else{
     utility('백업으로 기록을 바꿀까요?',`<p>선택한 파일의 설정과 ${Object.keys(pendingImport.checks).length}개 체크 기록, 개인 할 일 ${pendingImport.custom.length}개를 불러옵니다.</p><p>현재 기록과 자동 병합하지 않아요. 지금 기록은 교체 전에 별도의 백업 파일로 내려받습니다.</p><div class="utility-info">백업에는 가족 정보와 메모가 포함될 수 있어요. 본인이 신뢰하는 CHECK 파일만 불러오세요.</div>`,'<button class="secondary-button" data-action="close-utility">취소</button><button class="primary-button" data-action="confirm-import">백업 후 불러오기</button>');
   }
- }catch{pendingImport=null;toast('올바른 CHECK 백업 파일이 아니에요. 기존 기록은 바꾸지 않았어요.');}
+ }catch{pendingImport=null;pendingPreferences=null;toast('올바른 CHECK 백업 파일이 아니에요. 기존 기록은 바꾸지 않았어요.');}
 });
 for(const name of ['detail-dialog','utility-dialog']){
  const dialog=$(`#${name}`);
@@ -405,6 +513,7 @@ for(const name of ['detail-dialog','utility-dialog']){
 }
 function activateCloudFamily(familyId,seedLegacy){
  flushNotes();
+ cloudState={...cloudState,fromCache:true,hasPendingWrites:false,error:false};
  const legacy=cloneState(state);
  currentStorageKey=familyStorageKey(familyId);
  storageError='';corruptBackup='';
@@ -455,8 +564,8 @@ async function initCloud(){
 }
 function network(){
  const el=$('#network-status');
- if(cloudState.familyId)el.textContent=navigator.onLine?(cloudState.pending?'가족 동기화 중':'가족 자동 동기화'):'오프라인 · 재연결 대기';
- else el.textContent=navigator.onLine?'내 기기에 저장':'오프라인';
+ const status=connectionStatus({online:navigator.onLine,storageError,cloud:cloudState});
+ el.textContent=status.label;el.dataset.tone=status.tone;el.title=status.detail;
  el.classList.toggle('offline',!navigator.onLine);
 }
 window.addEventListener('online',network);window.addEventListener('offline',network);

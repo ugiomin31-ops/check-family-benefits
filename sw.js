@@ -1,8 +1,8 @@
 // Versioned app-shell cache. External forms and personal notes are not cached here.
 const BASE=new URL('./',self.location.href);
 const PREFIX='check-family:'+BASE.pathname+':';
-const VERSION=PREFIX+'80d67785865f7581';
-const FILES=['./','./index.html','./styles.css','./v2.css','./cloud.css','./app.js','./ui-v2.js','./engine.js','./cloud-logic.js','./cloud-sync.bundle.js','./firebase-config.js','./data.json','./manifest.webmanifest','./icons/icon.svg','./icons/icon-192.png','./icons/icon-512.png','./icons/maskable-512.png','./icons/apple-touch-icon.png'];
+const VERSION=PREFIX+'11c9839a434cb109';
+const FILES=['./','./index.html','./styles.css','./v2.css','./cloud.css','./experience.css','./app.js','./ui-v2.js','./experience.js','./engine.js','./cloud-logic.js','./cloud-sync.bundle.js','./firebase-config.js','./data.json','./manifest.webmanifest','./icons/icon.svg','./icons/icon-192.png','./icons/icon-512.png','./icons/maskable-512.png','./icons/apple-touch-icon.png'];
 const ASSETS=new Set(FILES.map(p=>new URL(p,BASE).href));
 self.addEventListener('install',event=>{
  event.waitUntil(caches.open(VERSION).then(cache=>cache.addAll(FILES.map(p=>new Request(new URL(p,BASE),{cache:'reload'})))));
